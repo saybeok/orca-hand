@@ -1,0 +1,25 @@
+# Virtualenv / caches (do not upload)
+.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.uv/
+
+# Nested official clones' original git dirs (kept locally as .git.upstream)
+**/.git.upstream/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs and local runtime
+*.log
+/tmp/
+
+# Optional huge generated renders
+orca_am200/renders/
