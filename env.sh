@@ -7,7 +7,7 @@
 unset PYTHONPATH
 unset LD_LIBRARY_PATH
 
-export ORCA_HAND_ROOT="/home/lee/orca_hand"
+export ORCA_HAND_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Retargeter resolves the URDF as
 # $ORCAHAND_DESCRIPTION_DIR/v1/models/urdf/orcahand_<hand>.urdf
