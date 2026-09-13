@@ -18,6 +18,7 @@ Typical usage inside the pipeline::
 import logging
 import queue
 import threading
+import time
 from concurrent import futures
 from dataclasses import dataclass
 from typing import Literal
@@ -50,6 +51,7 @@ class HandLandmarks:
     clutch_engaged: bool = False
     # One-shot: re-run the retargeter's auto-scale window (off-hand fist, etc.).
     retarget_recalibrate: bool = False
+    received_monotonic_ns: int = 0
 
 
 class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
@@ -70,6 +72,7 @@ class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
 
         try:
             for frame in request_iterator:
+                received_ns = time.perf_counter_ns()
                 if self._stop.is_set():
                     break
 
@@ -104,6 +107,7 @@ class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
                     keypoints=keypoints,
                     handedness=handedness,
                     timestamp_ns=frame.timestamp_ns,
+                    received_monotonic_ns=received_ns,
                     wrist_angle_degrees=frame.wrist_angle_degrees,
                     wrist_transform=wrist_transform,
                     clutch_supported=frame.clutch_supported,

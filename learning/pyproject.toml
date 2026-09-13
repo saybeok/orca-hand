@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paran-learning"
+version = "0.1.0"
+description = "Shared ORCA + AM-ARM200 demonstration, ACT and pi0.5 pipeline"
+requires-python = ">=3.10,<3.13"
+dependencies = ["numpy>=1.26,<3"]
+
+[project.optional-dependencies]
+learning = ["lerobot[pi]==0.4.4"]
+pedal = ["evdev>=1.7; sys_platform == 'linux'"]
+
+[project.scripts]
+paran-pipeline = "paran_learning.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

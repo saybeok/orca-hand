@@ -1,0 +1,30 @@
+{
+  "hardware_reviewed": false,
+  "robot_type": "am200_3dof_orca17",
+  "calibration_id": "",
+  "stop_mode": "retain_last_goal_requires_physical_support",
+  "fps": 15,
+  "hand_config": "REPLACE_WITH_CALIBRATED_HAND_CONFIG.yaml",
+  "arm_config": "REPLACE_WITH_PERSISTENT_ZERO_ARM_CONFIG.yaml",
+  "model_path": "../../orca_am200/robot_model/am_arm200_orca_right.xml",
+  "operator_calibration": "REPLACE_WITH_OPERATOR_CALIBRATION.yaml",
+  "lower_rad": [],
+  "upper_rad": [],
+  "max_velocity_rad_s": [],
+  "max_tracking_error_rad": [],
+  "episode_start_rad": [],
+  "episode_start_tolerance_rad": [],
+  "ingress_port": 50051,
+  "launch_quest_publisher": true,
+  "quest_web_port": 8443,
+  "arm_mapping": {
+    "scale": 0.3,
+    "deadband_m": 0.005,
+    "reanchor_jump_m": 0.15
+  },
+  "cameras": {
+    "top": {"index": 0, "width": 640, "height": 480, "fps": 30},
+    "front": {"index": 1, "width": 640, "height": 480, "fps": 30},
+    "wrist": {"index": 2, "width": 640, "height": 480, "fps": 30}
+  }
+}

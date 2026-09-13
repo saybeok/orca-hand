@@ -240,7 +240,7 @@ class OrcaHand(BaseHand):
             pass
 
     def connect(
-        self, interactive: bool = True, engage_feedback: bool = True
+        self, interactive: bool = True, engage_feedback: bool = True, auto_detect: bool = True
     ) -> tuple[bool, str]:
         """Open connection to the motor bus.
 
@@ -288,6 +288,9 @@ class OrcaHand(BaseHand):
             )
         logger.warning("Connection failed on %s: %s", first_port, error)
 
+        if not auto_detect:
+            return False, f"Connection failed on configured port {first_port}: {error}"
+
         chosen_port = auto_detect_port(self.config.motor_type)
         if chosen_port and chosen_port != first_port:
             if self._try_port(chosen_port, existing_config) is None:
@@ -308,8 +311,8 @@ class OrcaHand(BaseHand):
             return True, f"Connection successful with port {chosen_port}"
         return False, f"Connection failed with selected port: {str(error)}"
 
-    def disconnect(self) -> tuple[bool, str]:
-        """Disable torque (best-effort) and close the serial connection.
+    def disconnect(self, disable_torque: bool = True) -> tuple[bool, str]:
+        """Close serial; disable torque by default, or retain the existing goal.
 
         The client is always closed and discarded, even when the torque
         disable fails, so :meth:`is_connected` reports ``False`` afterwards
@@ -326,7 +329,10 @@ class OrcaHand(BaseHand):
         failure = None
         with self._motor_lock:
             try:
-                failed_ids = self.disable_torque()
+                # A supervised learning runner can retain the last motor goal
+                # during serial teardown. This is NOT a certified safe stop;
+                # a physical support / E-stop procedure is still required.
+                failed_ids = self.disable_torque() if disable_torque else []
                 if failed_ids:
                     failure = (
                         f"torque disable was not acknowledged by motor IDs {failed_ids}"
@@ -579,6 +585,23 @@ class OrcaHand(BaseHand):
                 of initialization (default ``True``). Set to ``False`` when
                 the caller will immediately command a different pose.
         """
+        if getattr(self._motor_client, "strict_io", False):
+            if not self.calibrated or force_calibrate or move_to_neutral:
+                raise RuntimeError("Strict learning startup requires existing calibration and no neutral motion")
+            # A physically supported arm/hand is required: mode changes disable
+            # torque. Strict Feetech mode does not re-enable an old goal.
+            self.set_control_mode(self.config.control_mode)
+            self.set_max_current(self.config.max_current)
+            current = self.get_motor_pos()
+            if not self._motor_client.last_read_ok:
+                raise RuntimeError("Incomplete hand boot read; torque remains disabled")
+            self.write_motor_pos(self.config.motor_ids, current)
+            failed = self.enable_torque()
+            if failed:
+                raise RuntimeError(f"Hand torque enable not acknowledged: {failed}")
+            self._compute_wrap_offsets_dict()
+            return
+
         self.enable_torque()
         self.set_control_mode(self.config.control_mode)
         self.set_max_current(self.config.max_current)

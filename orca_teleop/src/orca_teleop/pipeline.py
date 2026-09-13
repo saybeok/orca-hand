@@ -267,6 +267,7 @@ def retargeter_worker(
     landmarks_viz: Any | None = None,
     landmark_source: LandmarkSource = "mediapipe",
     action_composer: Callable[[HandLandmarks, OrcaJointPositions], Any] | None = None,
+    retargeter_reset_event: threading.Event | None = None,
 ) -> None:
     """Consume ``HandLandmarks`` from the gRPC ingress, retarget, push to actions_q.
 
@@ -300,6 +301,12 @@ def retargeter_worker(
             return
 
         while not stop_event.is_set():
+            if retargeter_reset_event is not None and retargeter_reset_event.is_set():
+                reset = getattr(retargeter, "reset", None)
+                if not callable(reset):
+                    raise RuntimeError("Recording requires a resettable retargeter")
+                reset()
+                retargeter_reset_event.clear()
             try:
                 item = queues.landmarks_q.get(timeout=HEARTBEAT_INTERVAL)
             except queue.Empty:

@@ -40,8 +40,9 @@ class AmArmFeetech:
         motor = motor_home + sign * model_q
     """
 
-    def __init__(self, config_path: str | Path | None = None) -> None:
+    def __init__(self, config_path: str | Path | None = None, strict_io: bool = False) -> None:
         self._cfg = load_arm_config(config_path)
+        self._strict_io = strict_io
         self._joint_names = list(ARM_JOINT_NAMES)
         jmap = self._cfg["joint_to_motor_map"]
         signs = self._cfg.get("joint_signs", {})
@@ -69,10 +70,33 @@ class AmArmFeetech:
         port = str(self._cfg["port"])
         baud = int(self._cfg.get("baudrate", 1_000_000))
         client = FeetechClient(self._motor_ids, port=port, baudrate=baud)
+        client.strict_io = self._strict_io
         client.connect()
-        client.set_operating_mode(self._motor_ids, CURRENT_BASED_POSITION)
-        client.set_torque_enabled(self._motor_ids, True)
-        home = client.read_position_velocity_current().position.astype(np.float64).copy()
+        try:
+            client.set_operating_mode(self._motor_ids, CURRENT_BASED_POSITION)
+            measured = client.read_position_velocity_current().position.astype(np.float64).copy()
+            if self._strict_io and not client.last_read_ok:
+                raise RuntimeError("Incomplete arm boot read; refusing cached motor values")
+            saved_zero = self._cfg.get("motor_zero_rad")
+            home = measured if saved_zero is None else np.asarray(saved_zero, dtype=np.float64)
+            if home.shape != (3,) or not np.isfinite(home).all() or not np.isin(self._signs, [-1, 1]).all():
+                raise ValueError("Invalid persistent motor zero or joint signs")
+            if saved_zero is not None:
+                boot_limits = np.asarray(self._cfg["boot_model_limits_rad"], dtype=np.float64)
+                model_q = (measured - home) / self._signs
+                if (boot_limits.shape != (3, 2) or not np.isfinite(boot_limits).all()
+                        or not np.isfinite(model_q).all()
+                        or np.any(model_q < boot_limits[:, 0]) or np.any(model_q > boot_limits[:, 1])):
+                    raise ValueError("Arm boot pose is outside calibrated limits; torque not enabled")
+                # Preload the present position instead of reusing an old goal.
+                client.write_desired_pos(self._motor_ids, measured.astype(np.float32),
+                                         speed=self._speed, torque=self._max_torque)
+            failed = client.set_torque_enabled(self._motor_ids, True)
+            if failed:
+                raise RuntimeError(f"Arm torque enable not acknowledged: {failed}")
+        except Exception:
+            client.disconnect()
+            raise
         self._client = client
         self._motor_home = home
         logger.info(
@@ -95,10 +119,13 @@ class AmArmFeetech:
 
     def read_motor_rad(self) -> np.ndarray:
         assert self._client is not None
-        return self._client.read_position_velocity_current().position.astype(np.float64)
+        state = self._client.read_position_velocity_current().position.astype(np.float64)
+        if self._strict_io and not self._client.last_read_ok:
+            raise RuntimeError("Incomplete arm state read; cached values cannot be recorded")
+        return state
 
     def read_model_rad(self) -> np.ndarray:
-        """Motor positions expressed as model radians relative to connect-home."""
+        """Model radians relative to persisted zero (legacy: connect-home)."""
         assert self._motor_home is not None
         motor = self.read_motor_rad()
         return (motor - self._motor_home) / self._signs

@@ -40,12 +40,14 @@ class Am200HardwareSink(RecordableSink):
         camera_configs: list[OpenCVCameraConfig] | None = None,
         enable_arm: bool = True,
         enable_hand: bool = True,
+        learning_mode: bool = False,
     ) -> None:
         self._hand_config_path = hand_config_path
         self._arm_config_path = Path(arm_config_path) if arm_config_path else default_arm_config_path()
         self._model_path = resolve_model_path(model_path)
         self._enable_arm = enable_arm
         self._enable_hand = enable_hand
+        self._learning_mode = learning_mode
         self._cameras = CameraManager(camera_configs or [])
 
         self._hand: OrcaHand | None = None
@@ -73,17 +75,24 @@ class Am200HardwareSink(RecordableSink):
 
         if self._enable_hand:
             hand = OrcaHand(str(self._hand_config_path))
-            ok, msg = hand.connect(interactive=False)
+            ok, msg = hand.connect(interactive=False, auto_detect=not self._learning_mode)
             if not ok:
                 raise RuntimeError(f"hand connect failed: {msg}")
-            hand.init_joints()
             self._hand = hand
+            if self._learning_mode:
+                hand.motor_client.strict_io = True
+            if self._learning_mode and not hand.calibrated:
+                raise RuntimeError("Learning mode requires existing hand calibration; no automatic calibration")
+            hand.init_joints(move_to_neutral=not self._learning_mode)
             self._target[self._map.hand_slice] = self._map.hand_from_physical(self.home_position())
 
         if self._enable_arm:
-            arm = AmArmFeetech(self._arm_config_path)
+            arm = AmArmFeetech(self._arm_config_path, strict_io=self._learning_mode)
             arm.connect()
             self._arm = arm
+
+        if self._learning_mode:
+            self._target = self._read_joint_state().astype(np.float64)
 
         self._cameras.open()
         self._cameras.ensure_live()
@@ -117,6 +126,10 @@ class Am200HardwareSink(RecordableSink):
             images=self._cameras.capture(),
         )
 
+    def read_joint_state(self) -> np.ndarray:
+        """Public measured-state boundary for the single-owner learning loop."""
+        return self._read_joint_state()
+
     def _read_joint_state(self) -> np.ndarray:
         assert self._map is not None
         state = np.zeros(self._map.dof, dtype=np.float32)
@@ -124,6 +137,8 @@ class Am200HardwareSink(RecordableSink):
             state[self._map.arm_slice] = self._arm.read_model_rad().astype(np.float32)
         if self._hand is not None:
             phys = self._hand.get_joint_position()
+            if self._learning_mode and not self._hand.motor_client.last_read_ok:
+                raise RuntimeError("Incomplete ORCA state read; cached values cannot be recorded")
             state[self._map.hand_slice] = self._map.hand_from_physical(phys).astype(np.float32)
         return state
 
@@ -142,12 +157,18 @@ class Am200HardwareSink(RecordableSink):
         self._last_command_ns = time.monotonic_ns()
         self._stale_logged = False
 
-    def dispatch_action(self, action: RobotJointCommand | OrcaJointPositions) -> None:
+    def dispatch_action(self, action: RobotJointCommand | OrcaJointPositions) -> np.ndarray:
         self.set_target(action)
         self._apply()
+        return self._target.copy()
 
     def _apply(self) -> None:
         assert self._map is not None and self._target is not None
+        if self._hand is not None and self._learning_mode:
+            physical = self._map.hand_to_physical(self._target[self._map.hand_slice])
+            clamped = self._hand.config.clamp_joint_positions(physical)
+            if not np.allclose(self._map.hand_from_physical(clamped), self._target[self._map.hand_slice], atol=1e-6):
+                raise ValueError("Hand ROM would change the accepted target; narrow learning safety limits")
         if self._arm is not None:
             self._arm.write_model_rad(self._target[self._map.arm_slice])
         if self._hand is not None:
@@ -198,15 +219,15 @@ class Am200HardwareSink(RecordableSink):
             self._stale_logged = True
 
     def close(self) -> None:
-        try:
-            self._cameras.close()
-            if self._hand is not None:
-                self._hand.disable_torque()
-                self._hand.disconnect()
-            if self._arm is not None:
-                self._arm.disconnect(disable_torque=True)
-        except Exception:
-            logger.exception("Am200HardwareSink.close() error")
-        finally:
-            self._hand = None
-            self._arm = None
+        # Each bus must be closed even if another bus's teardown fails.
+        for close in (
+            self._cameras.close,
+            lambda: self._hand.disconnect(disable_torque=not self._learning_mode) if self._hand else None,
+            lambda: self._arm.disconnect(disable_torque=not self._learning_mode) if self._arm else None,
+        ):
+            try:
+                close()
+            except Exception:
+                logger.exception("Am200HardwareSink.close() error")
+        self._hand = None
+        self._arm = None

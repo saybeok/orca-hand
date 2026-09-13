@@ -146,6 +146,7 @@ class FeetechClient(MotorClient):
         self.lazy_connect = lazy_connect
 
         self.pos_scale = pos_scale if pos_scale is not None else DEFAULT_POS_SCALE
+        self.strict_io = False  # Opt-in fail-closed behavior for learning capture.
         self.vel_scale = vel_scale if vel_scale is not None else DEFAULT_VEL_SCALE
         self.cur_scale = cur_scale if cur_scale is not None else DEFAULT_CUR_SCALE
 
@@ -440,6 +441,8 @@ class FeetechClient(MotorClient):
             # Mode changes require torque off; motors that never acked the
             # torque-disable are skipped so their mode is not changed blind.
             failed_ids = self.set_torque_enabled(motor_ids, False)
+            if self.strict_io and failed_ids:
+                raise RuntimeError(f"Torque-disable acknowledgement failed before mode change: {failed_ids}")
             if failed_ids:
                 logging.error(
                     'Skipping mode change for motors that did not ack torque '
@@ -460,9 +463,11 @@ class FeetechClient(MotorClient):
                         'Failed to set operating mode for motor %d: result=%d, error=%d',
                         motor_id, result, error
                     )
+                    if self.strict_io:
+                        raise RuntimeError(f"Operating-mode write failed for motor {motor_id}")
 
             # Re-enable torque
-            if acked_ids:
+            if acked_ids and not self.strict_io:
                 self.set_torque_enabled(acked_ids, True)
 
     def _read_state_per_motor_fallback(self) -> MotorRead:
@@ -844,7 +849,11 @@ class FeetechClient(MotorClient):
 
             for motor_id, pos_rad in zip(motor_ids, positions):
                 # STS servo mode uses raw 0–4095 (single rotation); clamp before sending.
-                pos_raw = self._clamp_position(self._rad_to_raw(pos_rad, self.pos_scale))
+                requested_raw = self._rad_to_raw(pos_rad, self.pos_scale)
+                pos_raw = self._clamp_position(requested_raw)
+                if self.strict_io and requested_raw != pos_raw:
+                    self.packet_handler.groupSyncWrite.clearParam()
+                    raise ValueError(f"Motor {motor_id} target would be silently clamped")
 
                 logging.debug(
                     'SyncWritePosEx: motor=%d, pos=%d, speed=%d, acc=%d, torque=%d',
@@ -861,6 +870,9 @@ class FeetechClient(MotorClient):
 
             # Clear params for next use
             self.packet_handler.groupSyncWrite.clearParam()
+
+            if self.strict_io and result != COMM_SUCCESS:
+                raise RuntimeError(f"Feetech sync write failed: result={result}")
 
     def read_position_velocity_current(self) -> MotorRead:
         """Read position, velocity, and current for all motors in one sync packet.

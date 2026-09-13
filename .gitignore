@@ -23,3 +23,7 @@
 
 # Optional huge generated renders
 orca_am200/renders/
+
+# Learning outputs and machine-specific calibration profiles
+/learning_outputs/
+/configs/learning/*.local.json

@@ -1,4 +1,17 @@
-# ORCA Hand v1 (Feetech, right) setup
+# PARAN — VR·ORCA 통합 학습
+
+파란학기용 VR 시연 수집, 풋 페달, 카메라 3대, ACT·π0.5 학습 파이프라인입니다.
+
+- 먼저 읽기: [설치·실행·팀 협업 가이드](learning/README.md)
+- 실행 명령: `python scripts/paran_pipeline.py --help`
+- 실기 설정 양식: [hardware.template.json](configs/learning/hardware.template.json)
+- 검증 범위: 자동 테스트 45개 및 모의 시연 90프레임. 실제 모델 학습·실기 동작은 아직 미검증입니다.
+- 현재 코드의 조립체: AM-ARM200 팔 3축 + ORCA 17축 = 20D. SO-101 5축 구성과 구분해야 합니다.
+
+팀 작업은 `paran` 브랜치에서 진행하고, 검토된 변경만 PR로 `main`에 반영합니다.
+시연 원본·학습 결과·개인 장비 설정은 Git에 올리지 않습니다.
+
+## 기존 ORCA Hand v1 (Feetech, right) setup
 
 Teleoperation stack for a v1 ORCA Hand with Feetech HLS servos, driven from a
 USB webcam through MediaPipe.

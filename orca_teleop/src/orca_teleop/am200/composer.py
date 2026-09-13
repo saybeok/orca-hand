@@ -148,7 +148,7 @@ class Am200ActionComposer:
     def arm_position(self) -> np.ndarray:
         return self._arm_q.copy()
 
-    def reset(self) -> None:
+    def reset(self, arm_position: np.ndarray | None = None) -> None:
         """Start a new episode: drop any clutch drift and restore the mapping.
 
         Called between episodes, this is what makes each one begin from the same
@@ -160,6 +160,11 @@ class Am200ActionComposer:
         self._flange_anchor = None
         self._last_operator = None
         self._engaged = False
+        if arm_position is not None:
+            position = np.asarray(arm_position, dtype=np.float64)
+            if position.shape != (3,) or not np.isfinite(position).all():
+                raise ValueError("Expected a finite 3-joint measured arm pose")
+            self._arm_q = position.copy()
 
     def __call__(
         self,

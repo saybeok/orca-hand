@@ -1,0 +1,16 @@
+# Install the two LOCAL workspace packages separately; do not fetch upstream
+# orca_core@main, which would omit this repository's combined-robot changes.
+numpy>=2.2.6,<2.3
+torch>=2.8,<2.11
+pytorch-kinematics
+grpcio>=1.62.3
+protobuf>=4.25.9,<5
+aiohttp>=3.10
+opencv-python-headless>=4.9,<4.13
+mujoco>=3.2,<4
+cmeel-tinyxml2<11
+cmeel-urdfdom<5
+nlopt
+pin>=3.8.0
+pyyaml>=6,<7
+evdev>=1.7; sys_platform == 'linux'

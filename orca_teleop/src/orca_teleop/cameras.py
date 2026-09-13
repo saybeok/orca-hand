@@ -38,7 +38,7 @@ class OpenCVCameraConfig:
     """Configuration for a single OpenCV-backed camera."""
 
     name: str
-    index: int = 0
+    index: int | str = 0
     width: int | None = None
     height: int | None = None
     fps: float | None = None
@@ -124,6 +124,13 @@ def _open_backend():
     return cv2.CAP_AVFOUNDATION if _IS_MACOS else cv2.CAP_ANY
 
 
+@dataclass(frozen=True)
+class TimestampedCameraFrame:
+    image: np.ndarray
+    sequence: int
+    received_ns: int  # PC monotonic receipt time, NOT sensor exposure time
+
+
 class OpenCVCamera:
     """A single OpenCV camera with a background reader thread.
 
@@ -141,6 +148,8 @@ class OpenCVCamera:
         self._latest: np.ndarray | None = None
         self._shape: tuple[int, int, int] | None = None
         self._last_ok_ts: float = 0.0
+        self._sequence = 0
+        self._received_ns = 0
 
     @property
     def name(self) -> str:
@@ -179,6 +188,7 @@ class OpenCVCamera:
             ok, frame = cap.read()
             if ok and frame is not None:
                 last_good = frame
+                self._received_ns = time.perf_counter_ns()
             time.sleep(0.01)
 
         if last_good is None:
@@ -200,7 +210,7 @@ class OpenCVCamera:
         self._thread.start()
 
         logger.info(
-            "Camera %r opened (index=%d, shape=%s%s)",
+            "Camera %r opened (index=%s, shape=%s%s)",
             self.name,
             self.config.index,
             self._shape,
@@ -226,6 +236,7 @@ class OpenCVCamera:
         assert self._cap is not None
         while not self._stop.is_set():
             ok, frame = self._cap.read()
+            received_ns = time.perf_counter_ns()
             if not ok or frame is None:
                 time.sleep(0.005)
                 continue
@@ -233,6 +244,8 @@ class OpenCVCamera:
             with self._lock:
                 self._latest = processed
                 self._last_ok_ts = time.monotonic()
+                self._received_ns = received_ns
+                self._sequence += 1
 
     def read(self) -> np.ndarray:
         """Return the most recently captured RGB frame.
@@ -252,6 +265,13 @@ class OpenCVCamera:
                 f"Camera {self.name!r} produced no fresh frame for {age:.1f}s; assuming it died."
             )
         return frame
+
+    def read_sample(self) -> TimestampedCameraFrame:
+        self.read()  # Preserve reader liveness checks.
+        with self._lock:
+            if self._latest is None:
+                raise RuntimeError(f"Camera {self.name!r} closed during capture")
+            return TimestampedCameraFrame(self._latest.copy(), self._sequence, self._received_ns)
 
     def close(self) -> None:
         self._stop.set()
@@ -318,6 +338,10 @@ class CameraManager:
     def capture(self) -> dict[str, np.ndarray]:
         """Return the latest frame from each camera as ``{name: RGB array}``."""
         return {camera.name: camera.read() for camera in self._cameras}
+
+    def capture_samples(self) -> dict[str, TimestampedCameraFrame]:
+        """Latest RGB frames with individual receipt timestamps and sequence IDs."""
+        return {camera.name: camera.read_sample() for camera in self._cameras}
 
     def ensure_live(self, samples: int = 3, interval_s: float = 0.05) -> None:
         """Verify every open camera keeps producing fresh frames.
