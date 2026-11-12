@@ -26,7 +26,7 @@ from orca_teleop.retargeting.urdf_offsets import (
 logger = logging.getLogger(__name__)
 
 FINGERS: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
-RetargeterBackend = Literal["rmsprop", "adaptive_analytical"]
+RetargeterBackend = Literal["rmsprop", "adaptive_analytical", "key_objectives", "dexpilot"]
 
 
 _ORCAHAND_DESCRIPTION_DIR_ENV = "ORCAHAND_DESCRIPTION_DIR"
@@ -118,6 +118,8 @@ class TargetPose:
     joint_positions: np.ndarray
     source: str = "mediapipe"
     wrist_angle_degrees: float = 0.0
+    # Source/receive timestamp for cadence-independent output limits and replay.
+    timestamp_ns: int | None = None
 
     def __post_init__(self) -> None:
         joints = np.array(self.joint_positions, dtype=float, copy=True)
@@ -377,6 +379,18 @@ class Retargeter:
         config_path: str | None = None,
         **kwargs,
     ) -> "Retargeter":
+        if backend == "dexpilot":
+            if kwargs:
+                raise ValueError(f"dexpilot does not accept RMSprop options: {sorted(kwargs)}")
+            from orca_teleop.retargeting.dexpilot import DexPilotRetargeter
+
+            return DexPilotRetargeter.from_paths(model_path, urdf_path, config_path)
+        if backend == "key_objectives":
+            if kwargs:
+                raise ValueError(f"key_objectives does not accept RMSprop options: {sorted(kwargs)}")
+            from orca_teleop.retargeting.key_objectives import KeyObjectivesRetargeter
+
+            return KeyObjectivesRetargeter.from_paths(model_path, urdf_path, config_path)
         if backend == "adaptive_analytical":
             if kwargs:
                 raise ValueError(
@@ -395,10 +409,10 @@ class Retargeter:
         if backend != "rmsprop":
             raise ValueError(
                 f"Unknown retargeter backend {backend!r}; expected 'rmsprop' or "
-                "'adaptive_analytical'."
+                "'adaptive_analytical' or 'key_objectives' or 'dexpilot'."
             )
         if config_path is not None:
-            raise ValueError("config_path is only supported by backend='adaptive_analytical'")
+            raise ValueError("config_path is only supported by adaptive_analytical or key_objectives")
         return cls(RetargeterConfig.from_paths(model_path, urdf_path, **kwargs))
 
     def _ik_loss(self, target_key_vectors: torch.Tensor) -> torch.Tensor:

@@ -31,6 +31,7 @@ from orca_teleop.am200 import (
     OperatorCalibration,
 )
 from orca_teleop.ingress.server import DEFAULT_PORT
+from orca_teleop.am200.tasks import TASKS
 from orca_teleop.pipeline import run, run_local, run_metaquest_local
 
 
@@ -43,6 +44,14 @@ def main() -> None:
         help="where hand landmarks come from (default: quest)",
     )
     parser.add_argument("--model-path", default=None, help="combined MJCF; defaults to orca_am200")
+    parser.add_argument(
+        "--task", choices=sorted(TASKS), default=None,
+        help="load an interactive manipulation scene (hwatu_mat: card on soft mat)",
+    )
+    parser.add_argument(
+        "--respawn-after", type=float, default=None, metavar="SECONDS",
+        help="respawn the task object after success/drop; omit to keep the result",
+    )
     parser.add_argument(
         "--hand-config",
         default=os.environ.get("ORCA_MODEL_PATH"),
@@ -65,14 +74,18 @@ def main() -> None:
     parser.add_argument(
         "--retargeter",
         default="adaptive_analytical",
-        choices=["rmsprop", "adaptive_analytical"],
+        choices=["rmsprop", "adaptive_analytical", "key_objectives", "dexpilot"],
     )
     parser.add_argument("--retarget-config", default=os.environ.get("ORCA_RETARGET_CONFIG"))
     parser.add_argument(
         "--arm-scale",
         type=float,
-        default=0.5,
-        help="metres of flange motion per metre of wrist motion (default: 0.5)",
+        default=0.35,
+        help="metres of flange motion per metre of wrist motion (default: 0.35, same as hardware)",
+    )
+    parser.add_argument(
+        "--arm-max-step", type=float, default=None,
+        help="same as hardware: limit arm position to +/- RAD from start, not speed",
     )
     parser.add_argument(
         "--no-arm",
@@ -93,6 +106,11 @@ def main() -> None:
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
     args = parser.parse_args()
+    if args.arm_max_step is not None and not (0 < args.arm_max_step < float("inf")):
+        parser.error("--arm-max-step must be finite and positive")
+    if args.respawn_after is not None:
+        if args.task is None or not (0 < args.respawn_after < float("inf")):
+            parser.error("--respawn-after requires --task and a finite positive duration")
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
@@ -104,6 +122,10 @@ def main() -> None:
         model_path=args.model_path,
         hand_config_path=args.hand_config,
         render_mode=args.render_mode,
+        task=args.task,
+        respawn_after_s=args.respawn_after,
+        arm_max_step_rad=args.arm_max_step,
+        arm_damping_ratio=1.0,
     )
 
     composer = None

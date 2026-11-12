@@ -167,6 +167,15 @@ wheels = [
 ]
 
 [[package]]
+name = "anytree"
+version = "2.13.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/bc/a8/eb55fab589c56f9b6be2b3fd6997aa04bb6f3da93b01154ce6fc8e799db2/anytree-2.13.0.tar.gz", hash = "sha256:c9d3aa6825fdd06af7ebb05b4ef291d2db63e62bb1f9b7d9b71354be9d362714", size = 48389, upload-time = "2025-04-08T21:06:30.662Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7b/98/f6aa7fe0783e42be3093d8ef1b0ecdc22c34c0d69640dfb37f56925cb141/anytree-2.13.0-py3-none-any.whl", hash = "sha256:4cbcf10df36b1f1cba131b7e487ff3edafc9d6e932a3c70071b5b768bab901ff", size = 45077, upload-time = "2025-04-08T21:06:29.494Z" },
+]
+
+[[package]]
 name = "arm-pytorch-utilities"
 version = "0.5.0"
 source = { registry = "https://pypi.org/simple" }
@@ -735,7 +744,7 @@ name = "cuda-bindings"
 version = "12.9.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-pathfinder" },
+    { name = "cuda-pathfinder", marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7a/d8/b546104b8da3f562c1ff8ab36d130c8fe1dd6a045ced80b4f6ad74f7d4e1/cuda_bindings-12.9.4-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4d3c842c2a4303b2a580fe955018e31aea30278be19795ae05226235268032e5", size = 12148218, upload-time = "2025-10-21T14:51:28.855Z" },
@@ -797,6 +806,24 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/89/50/767448e792d41bfb6094ee317a355c1cb221dca24b2e178e2203bbea2a77/deepdiff-8.6.2.tar.gz", hash = "sha256:186dcbd181e4d76cef11ab05f802d0056c5d6083c5a6748c1473e9d7481e183e", size = 634860, upload-time = "2026-03-18T17:16:33.785Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2b/5f/c52bd1255db763d0cdcb7084d2e90c42119cb229302c56bdf1d0aa78abd2/deepdiff-8.6.2-py3-none-any.whl", hash = "sha256:4d22034a866c3928303a9332c279362f714192d9305bac17c498720d095fd1b4", size = 91979, upload-time = "2026-03-18T17:16:32.171Z" },
+]
+
+[[package]]
+name = "dex-retargeting"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anytree" },
+    { name = "lxml" },
+    { name = "nlopt" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pin" },
+    { name = "pytransform3d" },
+    { name = "pyyaml" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/26/c1/2ed904c6adb9ef20eabc1ae1cd18acc7a20d1347c58c30a985987dd6b83f/dex_retargeting-0.5.0-py3-none-any.whl", hash = "sha256:347ce785181e7c7dff2c2ca1a55955f6b33b711d33a7171cb4ef89dc19bd66d3", size = 52307, upload-time = "2025-04-05T00:17:29.322Z" },
 ]
 
 [[package]]
@@ -2294,7 +2321,7 @@ name = "nvidia-cudnn-cu12"
 version = "9.10.2.21"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12" },
+    { name = "nvidia-cublas-cu12", marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ba/51/e123d997aa098c61d029f76663dedbfb9bc8dcf8c60cbd6adbe42f76d049/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:949452be657fa16687d0930933f032835951ef0892b37d2d53824d1a84dc97a8", size = 706758467, upload-time = "2025-06-06T21:54:08.597Z" },
@@ -2305,7 +2332,7 @@ name = "nvidia-cufft-cu12"
 version = "11.3.3.83"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12" },
+    { name = "nvidia-nvjitlink-cu12", marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1f/13/ee4e00f30e676b66ae65b4f08cb5bcbb8392c03f54f2d5413ea99a5d1c80/nvidia_cufft_cu12-11.3.3.83-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:4d2dd21ec0b88cf61b62e6b43564355e5222e4a3fb394cac0db101f2dd0d4f74", size = 193118695, upload-time = "2025-03-07T01:45:27.821Z" },
@@ -2332,9 +2359,9 @@ name = "nvidia-cusolver-cu12"
 version = "11.7.3.90"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12" },
-    { name = "nvidia-cusparse-cu12" },
-    { name = "nvidia-nvjitlink-cu12" },
+    { name = "nvidia-cublas-cu12", marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
+    { name = "nvidia-cusparse-cu12", marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
+    { name = "nvidia-nvjitlink-cu12", marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/85/48/9a13d2975803e8cf2777d5ed57b87a0b6ca2cc795f9a4f59796a910bfb80/nvidia_cusolver_cu12-11.7.3.90-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:4376c11ad263152bd50ea295c05370360776f8c3427b30991df774f9fb26c450", size = 267506905, upload-time = "2025-03-07T01:47:16.273Z" },
@@ -2345,7 +2372,7 @@ name = "nvidia-cusparse-cu12"
 version = "12.5.8.93"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12" },
+    { name = "nvidia-nvjitlink-cu12", marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c2/f5/e1854cb2f2bcd4280c44736c93550cc300ff4b8c95ebe370d0aa7d2b473d/nvidia_cusparse_cu12-12.5.8.93-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:1ec05d76bbbd8b61b06a80e1eaf8cf4959c3d4ce8e711b65ebd0443bb0ebb13b", size = 288216466, upload-time = "2025-03-07T01:48:13.779Z" },
@@ -2458,15 +2485,43 @@ wheels = [
 
 [[package]]
 name = "orca-core"
-version = "0.2.1"
-source = { git = "https://github.com/orcahand/orca_core.git?rev=main#e4e9518defe5119b5a5f6d73c38796deba96a0ab" }
+version = "0.4.0"
+source = { editable = "../orca_core" }
 dependencies = [
     { name = "dynamixel-sdk" },
     { name = "fastapi" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pyserial" },
     { name = "pyyaml" },
     { name = "uvicorn" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "dynamixel-sdk", specifier = ">=3.7.31,<4.0.0" },
+    { name = "fastapi", specifier = ">=0.115.12,<0.116.0" },
+    { name = "numpy", specifier = ">=2.2.6,<3.0.0" },
+    { name = "pyserial", specifier = ">=3.5,<4.0" },
+    { name = "pyyaml", specifier = ">=6.0.2,<7.0.0" },
+    { name = "uvicorn", specifier = ">=0.34.2,<0.35.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "httpx", specifier = ">=0.27,<1.0" },
+    { name = "pytest", specifier = ">=8.3.5,<9.0.0" },
+]
+docs = [
+    { name = "mkdocs", specifier = "==1.6.1" },
+    { name = "mkdocs-autorefs", specifier = "==1.4.2" },
+    { name = "mkdocs-awesome-pages-plugin", specifier = "==2.10.1" },
+    { name = "mkdocs-get-deps", specifier = "==0.2.0" },
+    { name = "mkdocs-material", specifier = "==9.5.0" },
+    { name = "mkdocs-material-extensions", specifier = "==1.3.1" },
+    { name = "mkdocstrings", specifier = "==0.29.1" },
+    { name = "mkdocstrings-python", specifier = "==1.16.12" },
+    { name = "pymdown-extensions", specifier = "==10.8.1" },
 ]
 
 [[package]]
@@ -2505,12 +2560,16 @@ adaptive = [
 avp = [
     { name = "avp-stream" },
 ]
+dexpilot = [
+    { name = "dex-retargeting" },
+]
 learning = [
     { name = "aiohttp" },
     { name = "cmeel-tinyxml2" },
     { name = "cmeel-urdfdom" },
     { name = "lerobot" },
     { name = "mediapipe-numpy2" },
+    { name = "mujoco" },
     { name = "nlopt" },
     { name = "opencv-python" },
     { name = "pin" },
@@ -2540,14 +2599,16 @@ requires-dist = [
     { name = "avp-stream", marker = "extra == 'avp'", specifier = ">=1.0,<2.0" },
     { name = "cmeel-tinyxml2", marker = "extra == 'adaptive'", specifier = "<11" },
     { name = "cmeel-urdfdom", marker = "extra == 'adaptive'", specifier = "<5" },
+    { name = "dex-retargeting", marker = "extra == 'dexpilot'", specifier = "==0.5.0" },
     { name = "grpcio", specifier = ">=1.62.3" },
     { name = "lerobot", marker = "extra == 'learning'", specifier = ">=0.4,<0.5" },
     { name = "manus-client", marker = "extra == 'manus'", url = "https://github.com/orcahand/manus-client/releases/download/v0.1.0/manus_client-0.1.0-py3-none-manylinux_2_35_x86_64.whl" },
     { name = "mediapipe-numpy2", marker = "extra == 'mediapipe'" },
+    { name = "mujoco", marker = "extra == 'learning'", specifier = "==3.6.0" },
     { name = "nlopt", marker = "extra == 'adaptive'" },
     { name = "numpy", specifier = ">=2.0.0,<3.0.0" },
     { name = "opencv-python", marker = "extra == 'mediapipe'" },
-    { name = "orca-core", git = "https://github.com/orcahand/orca_core.git?rev=main" },
+    { name = "orca-core", editable = "../orca_core" },
     { name = "orca-sim", marker = "extra == 'sim'", git = "https://github.com/orcahand/orca_sim.git?rev=main" },
     { name = "orca-teleop", extras = ["mediapipe", "metaquest", "adaptive"], marker = "extra == 'learning'" },
     { name = "pin", marker = "extra == 'adaptive'", specifier = ">=3.8.0" },
@@ -2558,7 +2619,7 @@ requires-dist = [
     { name = "pyzmq", marker = "extra == 'manus'", specifier = ">=25.0" },
     { name = "torch", specifier = ">=2.8.0" },
 ]
-provides-extras = ["test", "mediapipe", "adaptive", "avp", "metaquest", "manus", "sim", "learning"]
+provides-extras = ["test", "mediapipe", "adaptive", "avp", "dexpilot", "metaquest", "manus", "sim", "learning"]
 
 [[package]]
 name = "orderly-set"
@@ -3195,6 +3256,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/de/b5/7d1b68e7eaf16411c3e0e2707e6b0e4ff053f9765deb72a70279fd54d0a5/pytorch_seed-0.2.0.tar.gz", hash = "sha256:096edd3404f8a00f3df2bab41024945806baf1f64b05678c82373b780458e1a3", size = 5234, upload-time = "2023-02-15T18:34:28.759Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5c/7b/6e29f8600d0df90ffce98850130e5ac993e1e29101fa655e38f6c0f60393/pytorch_seed-0.2.0-py3-none-any.whl", hash = "sha256:50a1ee2f62e55f88c20069849aa12265a007aeaea6893f3d23ad4e40173c5c89", size = 4201, upload-time = "2023-02-15T18:34:27.098Z" },
+]
+
+[[package]]
+name = "pytransform3d"
+version = "3.17.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "lxml" },
+    { name = "matplotlib" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2f/cb/bca3f2cba6b465517df2dcede0f11c50b77851b3a468f641ca5b8417da62/pytransform3d-3.17.0.tar.gz", hash = "sha256:f43d525751f02d12fa785d48348e842b6cfe2d5d1c9c09301b23a682c42e4afb", size = 8349388, upload-time = "2026-10-06T07:27:52.673Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/48/0a/924e5134fcc42f334bc2f2d5235ed9634ece56b67fe7567c476a6d0f7525/pytransform3d-3.17.0-py3-none-any.whl", hash = "sha256:c96b46d22ace4e616ead7ecbdedcf66ec77b70fa610fcd0826995755849b95d5", size = 172201, upload-time = "2026-10-06T07:27:29.055Z" },
 ]
 
 [[package]]

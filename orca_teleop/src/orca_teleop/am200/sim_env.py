@@ -9,8 +9,18 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
+import mujoco
+import numpy as np
 from orca_sim.envs import BaseOrcaHandEnv
+
+from orca_teleop.am200.dynamics import (
+    CommandDelay,
+    DynamicsRandomizer,
+    SimDynamics,
+    dynamics_path_for,
+)
 
 MODEL_PATH_ENV = "AM200_MODEL_PATH"
 DEFAULT_MODEL_PATH = (
@@ -36,13 +46,20 @@ def resolve_model_path(model_path: str | Path | None = None) -> Path:
 
 
 class AmArm200OrcaRightEnv(BaseOrcaHandEnv):
-    """The 20-DoF combined embodiment: 3-DoF arm plus the 17-DoF ORCA v1 hand."""
+    """The 20-DoF combined embodiment: 3-DoF arm plus the 17-DoF ORCA v1 hand.
+
+    ``dynamics`` (default: ``sim_dynamics.yaml`` beside the model) adds the arm
+    command delay and optional per-episode domain randomization, resampled on
+    every :meth:`reset`. ``randomize`` overrides the file's ``enabled`` flag.
+    """
 
     def __init__(
         self,
         model_path: str | Path | None = None,
         frame_skip: int | None = None,
         render_mode: str | None = None,
+        dynamics: SimDynamics | str | Path | None = None,
+        randomize: bool | None = None,
     ) -> None:
         path = resolve_model_path(model_path)
 
@@ -66,3 +83,50 @@ class AmArm200OrcaRightEnv(BaseOrcaHandEnv):
         self.version = "am_arm200_orca_right_v1"
         if frame_skip is None:
             self.frame_skip = max(1, round(1.0 / (_TARGET_CONTROL_HZ * self.model.opt.timestep)))
+
+        if not isinstance(dynamics, SimDynamics):
+            dynamics = SimDynamics.load(dynamics or dynamics_path_for(path))
+        if randomize is not None:
+            dynamics.randomization.enabled = randomize
+        self.dynamics = dynamics
+        self._randomizer = DynamicsRandomizer(self.model, dynamics)
+        self._delay = CommandDelay(self._randomizer.nominal_delays)
+
+    @property
+    def dynamics_sample(self) -> dict[str, Any]:
+        """Randomized factors of the current episode (empty when disabled)."""
+        return self._randomizer.last_sample
+
+    def reset(
+        self,
+        *,
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        super().reset(seed=seed, options=options)
+        self._delay = CommandDelay(self._randomizer.sample(self.np_random))
+        mujoco.mj_forward(self.model, self.data)
+        return self._get_obs(), self._get_info()
+
+    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+        if not self._delay.active:
+            return super().step(action)
+
+        action = np.asarray(action, dtype=np.float32)
+        if action.shape != self.action_space.shape:
+            raise ValueError(
+                f"Expected action shape {self.action_space.shape}, got {action.shape}"
+            )
+        self._delay.push(self.data.time, np.clip(action, self.action_low, self.action_high))
+        for _ in range(self.frame_skip):
+            self.data.ctrl[:] = self._delay.at(self.data.time)
+            mujoco.mj_step(self.model, self.data)
+
+        obs = self._get_obs()
+        reward = self._get_reward()
+        terminated = self._get_terminated()
+        truncated = self._get_truncated()
+        info = self._get_info()
+        if self.render_mode == "human":
+            self.render()
+        return obs, reward, terminated, truncated, info

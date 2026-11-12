@@ -16,7 +16,7 @@ dependencies = [
     "pytorch-kinematics",
     "grpcio>=1.62.3",
     "protobuf>=4.25.9,<5",
-    "orca_core @ git+https://github.com/orcahand/orca_core.git@main",
+    "orca_core",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +37,9 @@ adaptive = [
 avp = [
     "avp-stream>=1.0,<2.0",
 ]
+dexpilot = [
+    "dex-retargeting==0.5.0",
+]
 metaquest = [
     "aiohttp>=3.10",
 ]
@@ -51,7 +54,13 @@ learning = [
     # `uv sync --extra learning` is enough for dataset recording/training.
     "orca_teleop[mediapipe,metaquest,adaptive]",
     "lerobot>=0.4,<0.5",
+    "mujoco==3.6.0",
 ]
+
+[tool.uv.sources]
+# configs/*/calibration.yaml was recorded with this clone's Feetech conventions
+# (inverted position direction); the pinned git build reads the motors mirrored.
+orca_core = { path = "../orca_core", editable = true }
 
 [build-system]
 requires = ["hatchling>=1.27.0"]

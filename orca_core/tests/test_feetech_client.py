@@ -146,6 +146,74 @@ def _expected_pos(client: FeetechClient, raw: int) -> float:
     return FeetechClient._raw_to_rad(raw, client.pos_scale)
 
 
+@pytest.mark.parametrize('failure', [None, 'missing', 'invalid', 'bus'])
+def test_sts_position_limits_are_read_only_and_fail_closed(client, monkeypatch, failure):
+    feetech, handler = client
+    class Reader:
+        def __init__(self, packet, address, size):
+            assert packet is handler and (address, size) == (9, 4)
+        def addParam(self, motor_id):
+            pass
+        def txRxPacket(self):
+            return 1 if failure == 'bus' else COMM_SUCCESS
+        def isAvailable(self, motor_id, address, size):
+            return not (failure == 'missing' and motor_id == 2), 0
+        def getData(self, motor_id, address, size):
+            return {9: 691, 11: (600 if failure == 'invalid' else 2677)}[address]
+    monkeypatch.setattr(feetech_client_module, 'GroupSyncRead', Reader)
+    if failure:
+        with pytest.raises((OSError, ValueError)):
+            feetech.read_sts_position_limits()
+    else:
+        limits = feetech.read_sts_position_limits()
+        np.testing.assert_allclose(limits[2], sorted([_expected_pos(feetech, 691),
+                                                     _expected_pos(feetech, 2677)]))
+    assert not any('write' in entry for entry in handler.log)
+
+
+@pytest.mark.parametrize('disable_torque', [False, True])
+def test_disconnect_closes_port_and_only_releases_torque_when_requested(client, disable_torque):
+    feetech, handler = client
+    closed = []
+    feetech.port_handler = SimpleNamespace(is_using=False, closePort=lambda: closed.append(True))
+    feetech.OPEN_CLIENTS.add(feetech)
+    feetech.disconnect(disable_torque=disable_torque)
+    assert closed == [True]
+    assert not feetech._connected and feetech not in feetech.OPEN_CLIENTS
+    assert ('write1' in handler.log) == disable_torque
+
+
+@pytest.mark.parametrize('missing', [False, True])
+def test_sts_control_status_is_read_only_and_rejects_missing_replies(client, monkeypatch, missing):
+    feetech, handler = client
+    raw = {33: 0, 40: 1, 42: 200, 48: 700, 56: 400, 62: 118, 63: 42, 65: 32, 69: 100}
+
+    class Reader:
+        def __init__(self, packet, address, size):
+            assert packet is handler and (address, size) == (33, 38)
+            self.ids = []
+        def addParam(self, motor_id):
+            self.ids.append(motor_id)
+        def txRxPacket(self):
+            assert self.ids == [1, 2, 3]
+            return COMM_SUCCESS
+        def isAvailable(self, motor_id, address, size):
+            return not (missing and motor_id == 2), 0
+        def getData(self, motor_id, address, size):
+            return raw[address]
+
+    monkeypatch.setattr(feetech_client_module, 'GroupSyncRead', Reader)
+    if missing:
+        with pytest.raises(OSError, match='motor 2'):
+            feetech.read_sts_control_status()
+    else:
+        status = feetech.read_sts_control_status()
+        assert status[2]['torque_enabled'] == 1 and status[2]['torque_limit_raw'] == 700
+        assert status[2]['voltage_v'] == 11.8 and status[2]['error_status'] == 32
+        assert status[2]['position_rad'] == pytest.approx(_expected_pos(feetech, 400))
+    assert not any('write' in entry for entry in handler.log)
+
+
 def test_full_sync_read_reports_ok(client):
     feetech, _ = client
     read = feetech.read_position_velocity_current()
@@ -155,6 +223,28 @@ def test_full_sync_read_reports_ok(client):
         [_expected_pos(feetech, raw) for raw in (100, 200, 300)],
         rtol=1e-6,
     )
+
+
+@pytest.mark.parametrize("position", [6.0868358612, 6.0899038315, -7.0, np.nan, np.inf])
+def test_position_frame_rejects_feedback_that_cannot_be_commanded(client, position):
+    feetech, handler = client
+    with pytest.raises(ValueError, match="command frame|non-finite"):
+        feetech.validate_position_frame([15], [position])
+    assert not handler.log  # Validation itself never writes or probes the bus.
+
+
+def test_position_frame_accepts_native_single_turn_positions(client):
+    feetech, handler = client
+    positions = [_expected_pos(feetech, raw) for raw in (0,2048,4095)]
+    feetech.validate_position_frame([1,2,3], positions)
+    assert not handler.log
+
+
+def test_reported_positive_seam_limits_would_both_clamp_to_same_goal(client):
+    feetech, _ = client
+    bounds = [6.0868358612, 6.0899038315]
+    assert [feetech._clamp_position(feetech._rad_to_raw(p, feetech.pos_scale))
+            for p in bounds] == [0, 0]
 
 
 def test_partial_sync_read_keeps_cache_and_flags_not_ok(client):

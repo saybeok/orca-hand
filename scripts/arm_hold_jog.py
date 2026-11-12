@@ -12,7 +12,11 @@ import time
 
 import numpy as np
 
-from orca_teleop.am200.arm_client import AmArmFeetech, default_arm_config_path
+from orca_teleop.am200.arm_client import (
+    AmArmFeetech,
+    default_arm_config_path,
+    load_arm_config,
+)
 
 
 def main() -> int:
@@ -20,8 +24,11 @@ def main() -> int:
     parser.add_argument("--config", default=str(default_arm_config_path()))
     parser.add_argument("--delta", type=float, default=0.08, help="jog amplitude (rad)")
     parser.add_argument("--hold-s", type=float, default=2.0)
+    parser.add_argument("--speed", type=int, default=120, help="low-speed direction check")
     args = parser.parse_args()
 
+    cfg = load_arm_config(args.config)
+    torque = int(cfg.get("jog_torque", 350))
     arm = AmArmFeetech(args.config)
     arm.connect()
 
@@ -33,7 +40,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, _shutdown)
 
     print("holding current pose...", flush=True)
-    arm.hold_current()
+    arm.hold_current(torque=torque, speed=args.speed)
     time.sleep(args.hold_s)
 
     zero = np.zeros(3, dtype=np.float64)
@@ -42,13 +49,13 @@ def main() -> int:
         for sign in (+1.0, -1.0, 0.0):
             q = zero.copy()
             q[i] = sign * args.delta
-            arm.write_model_rad(q)
+            arm.write_model_rad(q, torque=torque, speed=args.speed)
             time.sleep(0.7)
-        arm.write_model_rad(zero)
+        arm.write_model_rad(zero, torque=torque, speed=args.speed)
         time.sleep(0.4)
 
     print(f"hold zero offset {args.hold_s}s then exit", flush=True)
-    arm.write_model_rad(zero)
+    arm.write_model_rad(zero, torque=torque, speed=args.speed)
     time.sleep(args.hold_s)
     arm.disconnect(disable_torque=True)
     print("done — torque OFF", flush=True)

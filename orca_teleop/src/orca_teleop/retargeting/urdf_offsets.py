@@ -66,7 +66,10 @@ PASSTHROUGH_JOINTS: frozenset[str] = frozenset({"wrist"})
 
 
 def physical_to_model(physical: float, ref: float) -> float:
-    """Physical joint angle -> URDF/MJCF joint angle, in whatever unit both share.
+    """Physical joint angle -> MuJoCo qpos, in whatever unit both share.
+
+    This historical helper name does not mean URDF hinge rotation. With the
+    AM200 adapter, URDF FK uses the resulting qpos minus ref (i.e. physical).
 
     ``ref`` is the model-space angle at which the joint is physically at zero,
     which is exactly MuJoCo's definition: the rotation a hinge applies is

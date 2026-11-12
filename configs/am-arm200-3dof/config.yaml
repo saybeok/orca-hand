@@ -1,6 +1,7 @@
 # AM-ARM200 follower — first 3 DoF only (ORCA hand mounts on the flange).
 # Motors probed 2026-09-04 on this unit.
-port: /dev/ttyACM1
+# Stable USB-serial path (the hand adapter is ...5B79079884).
+port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_5B79018828-if00
 baudrate: 1000000
 motor_type: feetech
 
@@ -10,9 +11,9 @@ joint_to_motor_map:
   shoulder_lift: 2
   elbow_flex: 3
 
-# +1 until flex/extend direction is verified against MuJoCo/IK.
+# Per-joint motor polarity; independent of Quest coordinates and hand tracking.
 joint_signs:
-  shoulder_pan: -1   # flipped 2026-09-04 (user: 좌우 반전)
+  shoulder_pan: -1   # 2026-11-08: reverse pan only after operator confirmed opposite lateral motion
   shoulder_lift: 1
   elbow_flex: 1
 
@@ -25,3 +26,15 @@ default_speed: 1500
 # Soft per-command step cap from the captured home (rad).
 # null = no software clip (IK / servo stops still apply).
 max_step_from_home_rad: null
+
+# Teach once via the collector's "현재 팔을 초기 자세로 저장" button (녹화 대기).
+home_pose_file: ../../data/arm_home/initial_pose.json
+home_velocity_deg_s: 15
+home_acceleration_deg_s2: 45
+# Loaded elbow holds ~3.7 deg from the requested pose on this assembly.
+# Arrival tolerance only: keep the taught pose and motor command unchanged.
+home_tolerance_deg: 5
+return_home_on_close: true
+hold_on_disconnect: true
+# Read-only, once-per-second feedback to diagnose loaded-arm sag at VR start.
+feedback_diagnostics: true

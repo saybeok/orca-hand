@@ -30,7 +30,10 @@
         upper arm links remain visual-only because no collision meshes exist.
   -->
   <compiler angle="radian" eulerseq="XYZ" autolimits="true" inertiafromgeom="false" />
-  <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast" />
+  <!-- Elliptic friction cones with impratio 10: with the default pyramidal cone
+       and impratio 1, soft-contact creep lets a fingertip pinch slide off a held
+       object within 0.5-4 s; with these settings the scripted pinch holds. -->
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast" cone="elliptic" impratio="10" />
   <visual>
     <global azimuth="135" elevation="-20" offwidth="1280" offheight="960" />
     <headlight ambient="0.35 0.35 0.35" diffuse="0.8 0.8 0.8" specular="0.2 0.2 0.2" />
@@ -61,6 +64,7 @@
     <mesh name="mesh_j4_orca_direct"
           file="assets/am/OB_F_J4_Elbow_ORCA_direct_M6_v12_50mm_VERTICAL_SMOOTH.stl"
           scale="0.001 0.001 0.001" />
+    <mesh name="mesh_wrist_cam_mount" file="assets/am/CameraMount.stl" scale="0.001 0.001 0.001" />
     <model name="orcahand_right" file="orcahand_right_v1.xml" />
   </asset>
 
@@ -102,11 +106,34 @@
               <site name="orca_frame_y" type="cylinder" pos="0 0.025 0" size="0.0015 0.025" quat="0.70710678 -0.70710678 0 0" rgba="0 1 0 0.65" />
               <site name="orca_frame_z" type="cylinder" pos="0 0 0.025" size="0.0015 0.025" rgba="0 0 1 0.65" />
 
+              <!-- Wrist camera mount (assets/am/CameraMount.stl, mm). Its 4 mm plate is
+                   clamped between the flange and the hand tower by the two M6 bolts at
+                   flange (x=-3, y=+-25) mm; the arm reaches 90 mm toward the palm side
+                   (flange -y). This matches the camera mount of the official ORCA v1
+                   "extended" model (orcahand_description v1/.../right_visual_tower_camera.stl),
+                   whose bracket coincides with this mesh and which carries the camera
+                   board with its lens facing the bracket top normal (0, -0.1726, 0.985):
+                   along the hand, tilted 10 deg away from the palm. The case box and
+                   lens position are taken from that model. Mass estimated.
+                   Collision: boxes around the bracket and the camera case; the plate
+                   and arm root sit under the tower. UNVERIFIED: fovy (depends on the
+                   physical camera/lens). -->
+              <body name="wrist_cam_mount" pos="-0.003 0 0">
+                <inertial pos="0 -0.06 0.03" mass="0.06" diaginertia="3e-5 1e-5 3e-5" />
+                <geom class="am_j4_visual" name="vis_wrist_cam_mount" mesh="mesh_wrist_cam_mount" rgba="0.25 0.25 0.28 1" />
+                <geom name="vis_wrist_cam_body" type="box" pos="-0.00175 -0.07481 0.04369" euler="0.1735 0 0" size="0.02725 0.01785 0.01205"
+                      contype="0" conaffinity="0" group="2" rgba="0.1 0.1 0.1 1" />
+                <geom class="am_collision" name="col_wrist_cam_bracket" type="box" pos="0 -0.0726 0.0170" size="0.0085 0.0176 0.0170" />
+                <geom class="am_collision" name="col_wrist_cam_body" type="box" pos="-0.00175 -0.07481 0.04369" euler="0.1735 0 0" size="0.02725 0.01785 0.01205" />
+                <camera name="wrist_cam" pos="-0.007 -0.07669 0.05641" xyaxes="-1 0 0 0 0.985 0.1726" fovy="60" />
+              </body>
+
               <!-- Solved by scripts/derive_mount.py, which lands the v1 tower's mounting
                    face exactly on the flange origin, sends the hand along flange +z, and
                    rolls 180 deg about that axis so the palm faces world-down at the arm's
-                   rest pose. The x offset is the tower's half width. -->
-              <body name="orca_mount" pos="0.0783650538 0 -0.000119109121" quat="0 0 0 1">
+                   rest pose. The x offset is the tower's half width. z is raised 4 mm by
+                   the wrist camera mount plate sandwiched under the tower. -->
+              <body name="orca_mount" pos="0.0783650538 0 0.003880890879" quat="0 0 0 1">
                 <attach model="orcahand_right" body="right_tower" prefix="" />
               </body>
             </body>

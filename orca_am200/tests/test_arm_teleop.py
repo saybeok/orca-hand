@@ -408,3 +408,23 @@ def test_the_command_is_in_the_canonical_order(composer, hand_action):
     expected = CanonicalJointMap.load(MODEL_PATH.parent / "joint_map.json", model)
     action = composer(frame_at(np.zeros(3)), hand_action)
     assert action.joint_ids == expected.roles
+
+
+def test_hold_arm_composer_emits_full_command_with_arm_at_home(hand_action):
+    import mujoco
+
+    from orca_teleop.am200 import HoldArmActionComposer
+
+    model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+    joint_map = CanonicalJointMap.load(MODEL_PATH.parent / "joint_map.json", model)
+    command = HoldArmActionComposer(joint_map)(frame_at([0.3, 0.1, 0.2]), hand_action)
+
+    assert isinstance(command, RobotJointCommand)
+    assert len(command.position) == TOTAL_DOF
+    np.testing.assert_allclose(command.position[joint_map.arm_slice], np.zeros(ARM_DOF))
+    np.testing.assert_allclose(
+        command.position[joint_map.hand_slice],
+        joint_map.clip(np.r_[np.zeros(ARM_DOF), joint_map.hand_from_physical(hand_action)])[
+            joint_map.hand_slice
+        ],
+    )

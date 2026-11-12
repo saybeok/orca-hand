@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -22,7 +23,7 @@ from orca_teleop.retargeting.constants import (
     MANO_TO_URDF_TRANSLATION,
 )
 from orca_teleop.retargeting.retargeter import FINGERS, TargetPose
-from orca_teleop.retargeting.urdf_offsets import load_ref_offsets, physical_to_model
+from orca_teleop.retargeting.urdf_offsets import load_ref_offsets
 
 M_TO_CM = 100.0
 MANO_OFFSET_CM = np.array([0.0, 0.0, 1.5], dtype=np.float64)
@@ -205,6 +206,7 @@ class AdaptiveAnalyticalRetargeter:
         self.urdf_path = str(urdf_path)
 
         cfg_path = Path(config_path) if config_path is not None else _default_config_path()
+        self._config_dir = cfg_path.resolve().parent
         with open(cfg_path) as f:
             self.config: dict[str, Any] = yaml.safe_load(f)
 
@@ -218,14 +220,67 @@ class AdaptiveAnalyticalRetargeter:
         self._build_joint_mapping()
         self._build_frame_indices()
         self._build_retarget_params()
+        if self._pinch_objective == "relative_vector":
+            # One kinematic fingertip definition for shape, distal direction,
+            # scale and relative position. These frame origins are proxies,
+            # not measured skin-pad contacts or transmission calibration.
+            self._frame_offsets = self._contact_offsets
+            logger.info("Pinch objective: relative_vector | shared fingertip frames; "
+                        "continuous shape release; no hull-clearance/pose target. "
+                        "long_finger_tracking=%s, pinch_proximal_dir_weight=%g | "
+                        "AKO-inspired hand-only adaptation; powered contact unverified.",
+                        self._long_finger_tracking, self._w_pinch_proximal_dir)
+        self._taught_contacts = None
+        self._last_taught_target = None
+        self._last_solve_pinch_vectors = None
+        self._last_solve_surface_targets_cm = None
+        self._pinch_entry_vectors_cm = np.full((4, 3), np.nan)
+        self._pinch_entry_clearance_cm = np.full(4, np.nan)
+        taught_path = self._retarget_cfg.get("contact_pose_library")
+        if taught_path:
+            from .contact_calibration import TaughtContacts
+
+            if self._retarget_cfg.get("contact_calibration") or self._retarget_cfg.get("surface_contact_calibration"):
+                raise ValueError("Choose contact geometry calibration or taught contact poses, not both")
+            if self._w_pinch <= 0 or self._pinch_max_joint_velocity <= 0:
+                raise ValueError("Taught contacts require pinch control and a positive joint velocity bound")
+            path = Path(taught_path)
+            self._taught_contacts = TaughtContacts(path if path.is_absolute() else self._config_dir / path, self)
+            logger.info("Taught contacts loaded: six or more physical poses per pair; powered contact remains unverified")
+
+        self._surface_contacts = None
+        surface_path = self._retarget_cfg.get("surface_contact_calibration")
+        if surface_path:
+            from .surface_contacts import CalibratedSurfaceContacts
+
+            if self._retarget_cfg.get("contact_calibration"):
+                raise ValueError("Choose point calibration or surface calibration, not both")
+            if self._w_pinch <= 0 or self._pinch_max_joint_velocity <= 0:
+                raise ValueError("Surface contact calibration requires pinch control and a positive velocity bound")
+            path = Path(surface_path)
+            self._surface_contacts = CalibratedSurfaceContacts(
+                path if path.is_absolute() else self._config_dir / path, self)
+            logger.info("Continuous skin-clearance candidate loaded; no recorded joint pose is enforced. "
+                        "Passive-contact consistency is within 5 mm; powered contact is unverified. "
+                        "closure_margin_mm(index,middle,ring,pinky)=%s | pinch_target_mode=%s",
+                        (self._surface_contact_closure_margin_cm * 10).tolist(), self._pinch_target_mode)
 
         self._filter = _LPFilter(float(self._retarget_cfg.get("lp_alpha", 0.15)))
         self._neutral_qpos_phys = self._build_neutral_qpos()
         self._build_target_alignment_params()
+        self._build_thumb_ip_reference()
         self._mano_scale: float = 1.0
         self._calibration_mags: list[np.ndarray] = []
         self._calibration_done: bool = False
         self._last_qpos_phys: np.ndarray | None = None
+        self._last_timestamp_ns: int | None = None
+        self._last_pinch_diagnostic_s = -float("inf")
+        self._fixed_joint_pose = {}
+        self._fixed_fingers = np.zeros(5, dtype=bool)
+        self._solver_failures = 0
+        self._solver_status = None
+        self._last_solver_warning_s = -float('inf')
+        self._last_final_diagnostic_s = -float('inf')
 
     @classmethod
     def from_paths(
@@ -242,6 +297,83 @@ class AdaptiveAnalyticalRetargeter:
         self._calibration_done = False
         self._mano_scale = 1.0
         self._last_qpos_phys = None
+        self._last_timestamp_ns = None
+        self._last_pinch_diagnostic_s = -float("inf")
+        self._last_taught_target = None
+        self._last_solve_pinch_vectors = None
+        self._last_solve_surface_targets_cm = None
+        self._pinch_entry_vectors_cm.fill(np.nan)
+        self._pinch_entry_clearance_cm.fill(np.nan)
+        if self._taught_contacts is not None:
+            self._taught_contacts.reset()
+
+    def set_fixed_hand_joints(self, pose_deg: dict[str, float]) -> None:
+        """Bind the collection mode before solving, not after the shared thumb IK."""
+        values = {}
+        for joint, degrees in pose_deg.items():
+            if joint not in self._finger_joint_ids:
+                raise ValueError(f'Unknown fixed finger joint: {joint}')
+            i = self._finger_joint_ids.index(joint)
+            value = float(np.deg2rad(degrees))
+            if not np.isfinite(value) or not self._lower_phys[i] <= value <= self._upper_phys[i]:
+                raise ValueError(f'Fixed finger joint outside physical ROM: {joint}')
+            values[i] = value
+        self._fixed_joint_pose = values
+        self._fixed_fingers = np.array([
+            all(i in values for i, joint in enumerate(self._finger_joint_ids)
+                if joint.startswith(finger + '_')) for finger in FINGERS
+        ])
+        weights = self._retarget_cfg.get('pinch_pair_weights', {})
+        self._pinch_pair_weights = np.array([float(weights.get(f, 1)) for f in FINGERS[1:]])
+        self._pinch_pair_weights[self._fixed_fingers[1:]] = 0
+        self._neutral_qpos_phys = self._build_neutral_qpos()
+        for i, value in values.items():
+            self._neutral_qpos_phys[i] = value
+        self.reset()
+        logger.info('Fixed joints bound inside IK: physical_deg=%s; pinch_pair_weights=%s',
+                    pose_deg, self._pinch_pair_weights.tolist())
+
+    def command_diagnostics(self, ik_deg, final_deg, timestamp_ns):
+        """Snapshot the final bounded command on this worker's FK, once/second.
+
+        The sink attaches its actual applied command and fresh encoder sample
+        to this same timestamp after writing. This avoids a second robot model
+        or concurrent access to the retargeter's mutable FK data.
+        """
+        now = time.monotonic()
+        if now - self._last_final_diagnostic_s < 1:
+            return None
+        self._last_final_diagnostic_s = now
+        q = np.deg2rad([final_deg[j] for j in self._finger_joint_ids])
+        self._robot.compute_positions_and_jacobians(
+            self._full_model_qpos(q), self._computed_frame_indices, self._contact_offsets)
+        trace = dict(command_timestamp_ns=int(timestamp_ns),
+                     pinch_target_mode=self._pinch_target_mode,
+                     pinch_objective=self._pinch_objective,
+                     long_finger_tracking=self._long_finger_tracking,
+                     pinch_proximal_dir_weight=self._w_pinch_proximal_dir,
+                     solver_status=self._solver_status, solver_failures=self._solver_failures,
+                     ik_deg={j: round(float(v), 3) for j, v in ik_deg.items()},
+                     final_deg={j: round(float(v), 3) for j, v in final_deg.items()},
+                     powered_contact_verified=False)
+        if self._pinch_objective == "relative_vector":
+            positions, _ = self._robot.frame_points(self._computed_frame_indices, self._contact_offsets)
+            tips = positions[self._tip_indices] * 1000
+            vectors = tips[1:]-tips[0]
+            trace['final_model_tip_gap_mm'] = np.linalg.norm(vectors, axis=1).tolist()
+            if self._last_solve_pinch_vectors is not None:
+                targets = self._last_solve_pinch_vectors * 10
+                trace['target_tip_gap_mm'] = np.linalg.norm(targets, axis=1).tolist()
+                trace['final_tip_vector_error_mm'] = np.linalg.norm(vectors-targets, axis=1).tolist()
+        if self._surface_contacts is not None:
+            distances, _ = self._surface_contacts.distances(with_jacobian=False)
+            trace['final_model_clearance_mm'] = np.round(distances * 1000, 3).tolist()
+            if self._last_solve_pinch_vectors is not None:
+                # Reuse precisely the targets used by this frame's solver.
+                targets = self._last_solve_surface_targets_cm
+                trace['target_clearance_mm'] = np.round(targets * 10, 3).tolist()
+                trace['final_residual_mm'] = np.round(distances * 1000 - targets * 10, 3).tolist()
+        return trace
 
     def retarget(self, target_pose: TargetPose) -> OrcaJointPositions | None:
         if target_pose.source != "mediapipe":
@@ -263,14 +395,19 @@ class AdaptiveAnalyticalRetargeter:
 
         keypoints = self._target_keypoints_in_urdf_frame(normalized)
 
-        qpos_phys = self._solve(keypoints)
+        qpos_phys = self._solve(keypoints, dt_s=self._frame_dt(target_pose.timestamp_ns))
         qpos_phys = self._filter.next(qpos_phys)
+        # Warm-start and regularize from the command we actually emitted,
+        # not a potentially different, pre-filter optimization result.
+        self._last_qpos_phys = qpos_phys.copy()
 
         finger_phys_deg = np.rad2deg(qpos_phys)
-        wrist_phys_deg = float(
-            np.clip(target_pose.wrist_angle_degrees, self._wrist_lower_deg, self._wrist_upper_deg)
-        )
-        wrist_signed = wrist_phys_deg if self.hand_type == "left" else -wrist_phys_deg
+        if self._retarget_cfg.get("pinch_diagnostics", False) and self._w_pinch > 0:
+            self._log_pinch_diagnostic(keypoints, finger_phys_deg)
+        wrist_signed = target_pose.wrist_angle_degrees * self._wrist_input_scale
+        if self.hand_type == "right":
+            wrist_signed = -wrist_signed
+        wrist_signed = float(np.clip(wrist_signed, self._wrist_lower_deg, self._wrist_upper_deg))
 
         return OrcaJointPositions(
             {
@@ -278,6 +415,115 @@ class AdaptiveAnalyticalRetargeter:
                 self._wrist_joint_id: wrist_signed,
             }
         )
+
+    def _log_pinch_diagnostic(self, keypoints: np.ndarray, finger_deg: np.ndarray) -> None:
+        """Inspect live input activation and commanded angles without motor reads."""
+        now = time.monotonic()
+        if now - self._last_pinch_diagnostic_s < 1.0:
+            return
+        self._last_pinch_diagnostic_s = now
+        distances = np.linalg.norm(keypoints[_MP_TIP_INDICES[1:]] - keypoints[4], axis=1) * M_TO_CM
+        active = [f for f, d, threshold, weight in zip(
+            FINGERS[1:], distances, self._pinch_d2, self._pinch_pair_weights, strict=True
+        ) if d < threshold and weight > 0]
+        commands = dict(zip(self._finger_joint_ids, finger_deg, strict=True))
+        # Diagnose the emitted command, not the last optimizer FK evaluation.
+        positions, _ = self._robot.compute_positions_and_jacobians(
+            self._full_model_qpos(np.deg2rad(finger_deg)),
+            self._computed_frame_indices, self._contact_offsets,
+        )
+        tips = positions[self._tip_indices]
+        model_gaps = np.linalg.norm(tips[1:] - tips[0], axis=1) * M_TO_CM
+        target_vectors = self._last_solve_pinch_vectors
+        if target_vectors is None:
+            target_vectors = self._compute_pinch_vectors(keypoints)
+        target_gaps = np.linalg.norm(target_vectors, axis=1)
+        if self._w_pinch_proximal_dir > 0 and active:
+            def bend_angles(proximal, distal):
+                norms = np.linalg.norm(proximal, axis=1) * np.linalg.norm(distal, axis=1)
+                cosine = np.sum(proximal*distal, axis=1) / np.maximum(norms, 1e-12)
+                values = np.degrees(np.arccos(np.clip(cosine, -1, 1)))
+                return [None if n < 1e-12 else round(float(v), 1)
+                        for n, v in zip(norms, values, strict=True)]
+            human_proximal = keypoints[_MP_PIP_INDICES[1:]]-keypoints[_MP_TIP_INDICES[1:]-3]
+            human_distal = keypoints[_MP_TIP_INDICES[1:]]-keypoints[_MP_DIP_INDICES[1:]]
+            model_proximal = positions[self._pip_indices[1:]]-positions[self._base_indices[1:]]
+            model_distal = tips[1:]-positions[self._dip_indices[1:]]
+            logger.info("Finger bend diag | order=index,middle,ring,pinky | "
+                        "input_proximal_distal_angle_deg=%s | model_proximal_distal_angle_deg=%s | "
+                        "pinch_proximal_dir_weight=%g | model angles are not independent link measurements",
+                        bend_angles(human_proximal, human_distal),
+                        bend_angles(model_proximal, model_distal), self._w_pinch_proximal_dir)
+        if self._surface_contacts is not None:
+            clearances, _ = self._surface_contacts.distances(with_jacobian=False)
+            targets = self._last_solve_surface_targets_cm
+            if targets is None:
+                targets = self._surface_contact_targets_cm(target_vectors, self._compute_pinch_alpha(keypoints))
+            goals = targets / M_TO_CM
+            logger.info("Skin contact diag | model_clearance_mm(index,middle,ring,pinky)=%s | "
+                        "target_clearance_mm=%s | residual_mm=%s | powered_contact_verified=false",
+                        np.round(clearances*1000, 2).tolist(), np.round(goals*1000, 2).tolist(),
+                        np.round((clearances-goals)*1000, 2).tolist())
+        lower, upper = np.rad2deg(self._lower_phys), np.rad2deg(self._upper_phys)
+        thumb_limits = []
+        joint_limits = []
+        for i, joint in enumerate(self._finger_joint_ids):
+            if finger_deg[i] - lower[i] <= 0.5:
+                joint_limits.append(f"{joint}:lower")
+                if joint.startswith("thumb_"):
+                    thumb_limits.append(f"{joint}:lower")
+            if upper[i] - finger_deg[i] <= 0.5:
+                joint_limits.append(f"{joint}:upper")
+                if joint.startswith("thumb_"):
+                    thumb_limits.append(f"{joint}:upper")
+        input_bend = []
+        for a, b, c in ((5, 6, 7), (6, 7, 8)):
+            first, second = keypoints[b] - keypoints[a], keypoints[c] - keypoints[b]
+            norm = float(np.linalg.norm(first) * np.linalg.norm(second))
+            input_bend.append(None if norm < 1e-12 else round(float(np.degrees(
+                np.arccos(np.clip(first @ second / norm, -1, 1))
+            )), 1))
+        thumb_input = self._human_thumb_ip_bend(keypoints)
+        thumb_target = self._thumb_ip_target_bend(keypoints)
+        thumb_model = (None if self._thumb_ip_index is None else
+                       round(float(finger_deg[self._thumb_ip_index]
+                                   + np.rad2deg(self._thumb_ip_rest_bend)), 1))
+        logger.info(
+            "Pinch diag | active=%s | scaled_gap_cm(index,middle,ring,pinky)=%s | "
+            "target_gap_cm=%s | model_gap_cm=%s | thumb_at_limit=%s | "
+            "input_index_bend_deg(pip,dip)=%s | "
+            "input_thumb_ip_bend_deg=%s | model_thumb_ip_bend_deg=%s | "
+            "target_thumb_ip_bend_deg=%s | "
+            "cmd_index_deg(abd,mcp,pip)=%s | cmd_thumb_deg(mcp,abd,pip,dip)=%s | "
+            "cmd_ring_deg(abd,mcp,pip)=%s | cmd_pinky_deg(abd,mcp,pip)=%s | "
+            "cmd_middle_deg(abd,mcp,pip)=%s | joint_at_limit=%s | taught_contact=%s | taught_joint_error_deg=%s",
+            ",".join(active) or "none", np.round(distances, 2).tolist(),
+            np.round(target_gaps, 2).tolist(), np.round(model_gaps, 2).tolist(),
+            ",".join(thumb_limits) or "none", input_bend,
+            None if thumb_input is None else round(float(np.rad2deg(thumb_input)), 1), thumb_model,
+            None if thumb_target is None else round(float(np.rad2deg(thumb_target)), 1),
+            [round(float(commands[f"index_{j}"]), 1) for j in ("abd", "mcp", "pip")],
+            [round(float(commands[f"thumb_{j}"]), 1) for j in ("mcp", "abd", "pip", "dip")],
+            [round(float(commands[f"ring_{j}"]), 1) for j in ("abd", "mcp", "pip")],
+            [round(float(commands[f"pinky_{j}"]), 1) for j in ("abd", "mcp", "pip")],
+            [round(float(commands[f"middle_{j}"]), 1) for j in ("abd", "mcp", "pip")],
+            ",".join(joint_limits) or "none",
+            ("none" if self._last_taught_target is None else
+             f"{self._last_taught_target.finger}:pose{self._last_taught_target.pose+1}"
+             f":blend{self._last_taught_target.strength:.2f}"),
+            (None if self._last_taught_target is None else round(float(np.max(np.abs(
+                finger_deg[self._last_taught_target.indices] - np.rad2deg(self._last_taught_target.angles)
+            ))), 2)),
+        )
+
+    def _frame_dt(self, timestamp_ns: int | None) -> float:
+        """Use acquisition cadence; never turn a tracking pause into a leap."""
+        now = time.monotonic_ns() if timestamp_ns is None or timestamp_ns <= 0 else int(timestamp_ns)
+        previous = self._last_timestamp_ns
+        if previous is not None and now <= previous:
+            return 0.0
+        self._last_timestamp_ns = now
+        return 1.0 / 30.0 if previous is None else min((now - previous) * 1e-9, 0.1)
 
     def _load_frame_map(self, config: dict[str, Any]) -> _FrameMap:
         versioned_cfg = config.get("robot_frames_by_version", {}).get(self.model_version, {})
@@ -392,15 +638,118 @@ class AdaptiveAnalyticalRetargeter:
         for finger, frame_name in zip(FINGERS, self._frame_map.tip, strict=True):
             frame_idx = self._computed_frame_names.index(frame_name)
             self._frame_offsets[frame_idx] = FINGERTIP_OFFSETS_M[finger]
+        # Shape matching keeps the original virtual-tip offsets. Pinch uses
+        # URDF tip frames; their coincidence is a kinematic proxy, not proof
+        # that the simulated meshes or physical finger pads make contact.
+        self._contact_offsets = [np.zeros(3, dtype=np.float64) for _ in self._computed_frame_names]
+        contact_profile = self._retarget_cfg.get("contact_calibration")
+        if contact_profile:
+            if self._retarget_cfg.get("pinch_objective") == "relative_vector":
+                raise ValueError("relative_vector uses shared fingertip frames without point calibration")
+            from .contact_calibration import load_offsets
+
+            profile_path = Path(contact_profile)
+            if not profile_path.is_absolute():
+                profile_path = self._config_dir / profile_path
+            corrections = load_offsets(profile_path, self)
+            for finger, frame_idx in zip(FINGERS, self._tip_indices, strict=True):
+                self._contact_offsets[frame_idx] = corrections[finger]
+            logger.info("Validated physical contact calibration loaded: %s", profile_path)
 
     def _build_retarget_params(self) -> None:
         cfg = self._retarget_cfg
+        self._scale_calibration = cfg.get('scale_calibration', 'fingertip_distance')
+        if self._scale_calibration not in ('fingertip_distance', 'bone_lengths'):
+            raise ValueError('scale_calibration must be fingertip_distance or bone_lengths')
+        self._wrist_input_scale = float(cfg.get('wrist_input_scale', 1.0))
+        if not np.isfinite(self._wrist_input_scale) or self._wrist_input_scale <= 0:
+            raise ValueError('wrist_input_scale must be finite and positive')
         self._huber_delta = float(cfg.get("huber_delta_cm", 2.0))
         self._huber_delta_dir = float(cfg.get("huber_delta_dir", 0.5))
         self._norm_delta = float(cfg.get("norm_delta", 50.0))
         self._w_pos = float(cfg.get("w_pos", 1.0))
         self._w_dir = float(cfg.get("w_dir", 10.0))
         self._w_full_hand = float(cfg.get("w_full_hand", 1.0))
+        self._w_pinch = float(cfg.get("w_pinch", 0.0))
+        self._pinch_objective = cfg.get("pinch_objective", "adaptive")
+        if self._pinch_objective not in ("adaptive", "relative_vector"):
+            raise ValueError("pinch_objective must be 'adaptive' or 'relative_vector'")
+        self._long_finger_tracking = cfg.get("long_finger_tracking", "palm_position")
+        if (self._long_finger_tracking not in ("palm_position", "bone_directions")
+                or (self._long_finger_tracking == "bone_directions"
+                    and self._pinch_objective != "relative_vector")):
+            raise ValueError("long_finger_tracking must be 'palm_position' or "
+                             "'bone_directions' (relative_vector only)")
+        self._w_pinch_proximal_dir = float(cfg.get("w_pinch_proximal_dir", 0.0))
+        if (not np.isfinite(self._w_pinch_proximal_dir) or self._w_pinch_proximal_dir < 0
+                or (self._w_pinch_proximal_dir > 0 and self._long_finger_tracking != "bone_directions")):
+            raise ValueError("w_pinch_proximal_dir must be finite and non-negative; "
+                             "a positive weight requires bone_directions")
+        if self._pinch_objective == "relative_vector" and (
+            any(cfg.get(k) for k in ("contact_pose_library", "contact_calibration", "surface_contact_calibration"))
+            or cfg.get("pinch_target_mode", "landmark") != "landmark" or self._w_pinch <= 0
+        ):
+            raise ValueError("relative_vector requires positive w_pinch and landmark targets, "
+                             "without contact pose/point/surface calibration")
+        self._w_thumb_ip_bend = float(cfg.get("w_thumb_ip_bend", 0.0))
+        if not np.isfinite(self._w_thumb_ip_bend) or self._w_thumb_ip_bend < 0:
+            raise ValueError("w_thumb_ip_bend must be finite and non-negative")
+        self._thumb_ip_bend_gain = float(cfg.get("thumb_ip_bend_gain", 1.0))
+        if not np.isfinite(self._thumb_ip_bend_gain) or self._thumb_ip_bend_gain <= 0:
+            raise ValueError("thumb_ip_bend_gain must be finite and positive")
+        # Legacy profiles may explicitly amplify only free motion. Otherwise
+        # use one gain throughout approach, contact and release.
+        self._thumb_ip_free_bend_gain = float(cfg.get("thumb_ip_free_bend_gain", self._thumb_ip_bend_gain))
+        if not np.isfinite(self._thumb_ip_free_bend_gain) or self._thumb_ip_free_bend_gain <= 0:
+            raise ValueError("thumb_ip_free_bend_gain must be finite and positive")
+        self._thumb_ip_bend_scope = cfg.get("thumb_ip_bend_scope", "pinch")
+        if self._thumb_ip_bend_scope not in ("pinch", "always", "free"):
+            raise ValueError("thumb_ip_bend_scope must be 'pinch', 'always', or 'free'")
+        self._thumb_ip_tracking = cfg.get("thumb_ip_tracking", "soft")
+        if self._thumb_ip_tracking not in ("soft", "direct_free"):
+            raise ValueError("thumb_ip_tracking must be 'soft' or 'direct_free'")
+        if self._thumb_ip_tracking == "direct_free" and self._thumb_ip_bend_scope == "pinch":
+            raise ValueError("direct_free thumb IP tracking requires thumb_ip_bend_scope: always or free")
+        pair_weights = cfg.get("pinch_pair_weights", {})
+        unknown_pairs = set(pair_weights) - set(FINGERS[1:])
+        if unknown_pairs:
+            raise ValueError(f"Unknown pinch_pair_weights fingers: {sorted(unknown_pairs)}")
+        self._pinch_pair_weights = np.array([float(pair_weights.get(f, 1.0)) for f in FINGERS[1:]])
+        if not np.isfinite(self._pinch_pair_weights).all() or np.any(self._pinch_pair_weights < 0):
+            raise ValueError("pinch_pair_weights must be finite and non-negative")
+        self._pinch_alpha_max = float(cfg.get("pinch_alpha_max", 0.7))
+        self._pinch_smooth_transition = bool(cfg.get("pinch_smooth_transition", False))
+        self._pinch_relax_tip_position = bool(cfg.get("pinch_relax_tip_position", False))
+        # Keep old custom configs readable, but express new limits in deg/s.
+        legacy_velocity = 30.0 * float(cfg.get("pinch_max_joint_step_deg", 0.0))
+        velocity = float(cfg.get("pinch_max_joint_velocity_deg_s", legacy_velocity))
+        if not np.isfinite(velocity) or velocity < 0:
+            raise ValueError("pinch_max_joint_velocity_deg_s must be finite and non-negative")
+        self._pinch_max_joint_velocity = np.deg2rad(velocity)
+        self._pinch_target_mode = cfg.get("pinch_target_mode", "landmark")
+        if self._pinch_target_mode not in ("landmark", "entry_anchored"):
+            raise ValueError("pinch_target_mode must be 'landmark' or 'entry_anchored'")
+        if self._pinch_target_mode == "entry_anchored" and (
+            not cfg.get("surface_contact_calibration") or cfg.get("contact_pose_library")
+            or self._w_pinch <= 0 or self._pinch_max_joint_velocity <= 0
+        ):
+            raise ValueError("entry_anchored targets require surface calibration, pinch control "
+                             "and a positive velocity bound, without taught contact poses")
+        # An explicit operator tuning, separate from the fitted contact bias.
+        # This asks for a smaller signed skin clearance, not a joint-angle
+        # offset or a change to the stored physical contact measurements.
+        raw_margin = cfg.get("surface_contact_closure_margin_mm", 0.0)
+        if isinstance(raw_margin, dict):
+            if set(raw_margin) != set(FINGERS[1:]):
+                raise ValueError("surface_contact_closure_margin_mm must contain index, middle, ring, pinky")
+            margin = np.array([float(raw_margin[f]) for f in FINGERS[1:]])
+        else:
+            margin = np.full(4, float(raw_margin))
+        if not np.isfinite(margin).all() or np.any(margin < 0) or np.any(margin > 10):
+            raise ValueError("surface_contact_closure_margin_mm must be finite and between 0 and 10")
+        if np.any(margin > 0) and not cfg.get("surface_contact_calibration"):
+            raise ValueError("A closure margin requires surface_contact_calibration")
+        self._surface_contact_closure_margin_cm = margin / 10.0
         self._scaling = float(cfg.get("scaling", 1.0))
 
         segment_cfg = cfg.get("segment_scaling", {})
@@ -420,6 +769,9 @@ class AdaptiveAnalyticalRetargeter:
         self._pinch_d2 = np.array(
             [pinch_cfg.get(f, {}).get("d2", 5.0) for f in FINGERS[1:]], dtype=np.float64
         )
+        if not (np.all(np.isfinite(self._pinch_d1)) and np.all(np.isfinite(self._pinch_d2))
+                and np.all(self._pinch_d1 >= 0) and np.all(self._pinch_d2 > self._pinch_d1)):
+            raise ValueError("pinch thresholds must satisfy 0 <= d1 < d2 and be finite")
 
         rotation = cfg.get("mediapipe_rotation", {})
         if any(float(rotation.get(axis, 0.0)) != 0.0 for axis in ("x", "y", "z")):
@@ -460,16 +812,105 @@ class AdaptiveAnalyticalRetargeter:
         palm = self._robot_palm_from_positions(neutral_positions)
         urdf_keyvectors = tip_pos - palm
         self._urdf_keyvector_mags = 0.9 * np.linalg.norm(urdf_keyvectors, axis=1)
+        chains = np.stack([neutral_positions[indices] for indices in
+                           (self._base_indices, self._pip_indices,
+                            self._dip_indices, self._tip_indices)], axis=1)
+        self._shape_bone_lengths = np.linalg.norm(np.diff(chains, axis=1), axis=2)
+        self._urdf_bone_lengths = 0.9 * self._shape_bone_lengths.sum(axis=1)
+
+    def _build_thumb_ip_reference(self) -> None:
+        """Derive the thumb's zero-angle bone bend from URDF tip-frame geometry.
+
+        For this single planar hinge, signed bone bend = joint angle + rest
+        bend. The positive tangent is sampled from FK, not a hard-coded sign
+        or visual pose offset. Parent thumb rotations cancel from the angle.
+        """
+        self._thumb_ip_index = (self._finger_joint_ids.index("thumb_dip")
+                                if "thumb_dip" in self._finger_joint_ids else None)
+        self._thumb_ip_rest_bend = 0.0
+        if self._thumb_ip_index is None:
+            if self._w_thumb_ip_bend > 0 or self._thumb_ip_tracking == "direct_free":
+                raise ValueError("Thumb IP bend objective requires thumb_dip")
+            return
+        q = np.zeros(len(self._finger_joint_ids))
+        samples = []
+        for angle in (0.0, 0.01):
+            q[self._thumb_ip_index] = angle
+            pos, _ = self._robot.compute_positions_and_jacobians(
+                self._full_model_qpos(q), self._computed_frame_indices, self._contact_offsets)
+            a = pos[self._dip_indices[0]] - pos[self._pip_indices[0]]
+            b = pos[self._tip_indices[0]] - pos[self._dip_indices[0]]
+            lengths = np.array([np.linalg.norm(a), np.linalg.norm(b)])
+            if not np.isfinite(lengths).all() or np.any(lengths < 1e-9):
+                raise ValueError("Degenerate robot thumb segments for IP bend reference")
+            samples.append((a / lengths[0], b / lengths[1]))
+        proximal, distal = samples[0]
+        tangent = samples[1][1] - distal
+        tangent -= (tangent @ proximal) * proximal
+        length = np.linalg.norm(tangent)
+        if not np.isfinite(length) or length < 1e-9:
+            raise ValueError("Degenerate robot thumb IP flexion axis")
+        tangent /= length
+        self._thumb_ip_rest_bend = float(np.arctan2(distal @ tangent, distal @ proximal))
+        if self._w_thumb_ip_bend > 0 or self._thumb_ip_tracking == "direct_free":
+            logger.info("Thumb IP tracking enabled: mode=%s, weight=%g, scope=%s, bend_gain=%g, free_gain=%g, URDF rest bend=%.2f deg",
+                        self._thumb_ip_tracking, self._w_thumb_ip_bend, self._thumb_ip_bend_scope,
+                        self._thumb_ip_bend_gain, self._thumb_ip_free_bend_gain,
+                        np.rad2deg(self._thumb_ip_rest_bend))
+
+    @staticmethod
+    def _human_thumb_ip_bend(keypoints: np.ndarray) -> float | None:
+        """MCP->IP versus IP->tip flexion magnitude (radians, scale invariant).
+
+        Three points do not resolve signed human hyperextension. This is a
+        flexion-magnitude target, not a calibrated signed anatomical angle copy.
+        """
+        a, b = keypoints[3] - keypoints[2], keypoints[4] - keypoints[3]
+        norm = float(np.linalg.norm(a) * np.linalg.norm(b))
+        if not np.isfinite(norm) or norm < 1e-12:
+            return None
+        return float(np.arccos(np.clip(a @ b / norm, -1, 1)))
+
+    def _thumb_ip_target_bend(self, keypoints: np.ndarray) -> float | None:
+        """Scale positive IP travel consistently, preserving extension.
+
+        Raw landmarks and contact targets stay unchanged. The scaled target
+        enters both direct tracking and the bend objective before solving;
+        normal joint ROM and per-frame velocity bounds still apply.
+        Only a legacy free-only override changes gain with pinch distance.
+        """
+        bend = self._human_thumb_ip_bend(keypoints)
+        if bend is None:
+            return None
+        if bend <= self._thumb_ip_rest_bend:
+            return bend
+        free = 1.0
+        if self._w_pinch > 0 and self._thumb_ip_free_bend_gain != self._thumb_ip_bend_gain:
+            alphas = self._compute_pinch_alpha(keypoints)[1:]
+            active = np.where(self._pinch_pair_weights > 0, alphas, 0)
+            activation = float(np.clip(active.max() / max(self._pinch_alpha_max, 1e-8), 0, 1))
+            free = 1.0 - activation**2 * (3 - 2 * activation)
+        gain = self._thumb_ip_bend_gain + free * (self._thumb_ip_free_bend_gain - self._thumb_ip_bend_gain)
+        return self._thumb_ip_rest_bend + gain * (bend - self._thumb_ip_rest_bend)
 
     def _ingest_calibration_frame(self, normalized_joints: np.ndarray, source: str) -> None:
-        joint_t = torch.tensor(normalized_joints, dtype=torch.float32)
-        fingertips, palm = retargeter_utils.extract_mano_fingertips_and_palm(
-            joint_t,
-            list(FINGERS),
-            source,
-        )
-        keyvectors = retargeter_utils.get_keyvectors(fingertips, palm)
-        mags = np.array([kv.detach().cpu().norm().item() for kv in keyvectors])
+        if self._scale_calibration == 'bone_lengths':
+            # Sum adjacent bone lengths, which do not shrink when the operator
+            # folds three fingers or recalibrates during a pinch.
+            joints = retargeter_utils.get_mano_joints_dict(normalized_joints, source)
+            mags = np.array([np.linalg.norm(np.diff(joints[finger], axis=0), axis=1).sum()
+                             for finger in FINGERS])
+            if not np.isfinite(mags).all() or np.any(mags <= 1e-5):
+                raise ValueError('Degenerate hand bone lengths during scale calibration')
+            reference = self._urdf_bone_lengths
+        else:
+            joint_t = torch.tensor(normalized_joints, dtype=torch.float32)
+            fingertips, palm = retargeter_utils.extract_mano_fingertips_and_palm(
+                joint_t, list(FINGERS), source,
+            )
+            keyvectors = retargeter_utils.get_keyvectors(fingertips, palm)
+            mags = np.array([kv.detach().cpu().norm().item() for kv in keyvectors])
+            reference = self._urdf_keyvector_mags
         self._calibration_mags.append(mags)
 
         if len(self._calibration_mags) < CALIBRATION_FRAMES:
@@ -477,15 +918,16 @@ class AdaptiveAnalyticalRetargeter:
 
         all_mags = np.array(self._calibration_mags)
         median_mano = np.median(all_mags, axis=0)
-        ratios = self._urdf_keyvector_mags / np.clip(median_mano, 1e-6, None)
+        ratios = reference / np.clip(median_mano, 1e-6, None)
         self._mano_scale = float(np.median(ratios))
         self._calibration_done = True
         self._last_qpos_phys = None
         self._filter.reset()
         logger.info(
-            "Adaptive retargeter auto-scale calibrated: mano_scale=%.4f " "(per-finger ratios=%s)",
+            "Adaptive retargeter auto-scale calibrated: mano_scale=%.4f " "(per-finger ratios=%s, method=%s)",
             self._mano_scale,
             np.round(ratios, 3).tolist(),
+            self._scale_calibration,
         )
 
     def _target_keypoints_in_urdf_frame(self, normalized_joints: np.ndarray) -> np.ndarray:
@@ -496,7 +938,7 @@ class AdaptiveAnalyticalRetargeter:
             + np.array(MANO_TO_URDF_TRANSLATION)
         )
 
-    def _solve(self, keypoints: np.ndarray) -> np.ndarray:
+    def _solve(self, keypoints: np.ndarray, dt_s: float = 1.0 / 30.0) -> np.ndarray:
         init_qpos = self._initial_qpos()
         reg_qpos = self._last_qpos_phys
 
@@ -504,12 +946,94 @@ class AdaptiveAnalyticalRetargeter:
         target_tip_vectors = self._compute_tip_vectors(keypoints)
         target_tip_dirs = self._compute_tip_dirs(keypoints)
         target_full_hand_vectors = self._compute_full_hand_vectors(keypoints)
+        target_pinch_vectors = self._compute_pinch_vectors(keypoints)
+        thumb_ip_bend = self._thumb_ip_target_bend(keypoints)
 
         opt = self._nlopt.opt(self._nlopt.LD_SLSQP, len(self._finger_joint_ids))
         opt.set_maxeval(int(self._retarget_cfg.get("maxeval", 50)))
         opt.set_ftol_abs(float(self._retarget_cfg.get("ftol_abs", 1e-4)))
-        opt.set_lower_bounds(self._lower_phys.tolist())
-        opt.set_upper_bounds(self._upper_phys.tolist())
+        lower, upper = self._lower_phys, self._upper_phys
+        # Keep bounds local: direct tracking fixes one variable and must not
+        # mutate the configured physical ROM for subsequent frames.
+        lower, upper = lower.copy(), upper.copy()
+        if (self._w_pinch > 0 or self._thumb_ip_tracking == "direct_free") and self._pinch_max_joint_velocity > 0:
+            # Bound the optimization itself, including contact release. A
+            # continuous objective can still jump between IK solutions.
+            if not np.isfinite(dt_s) or dt_s < 0:
+                raise ValueError("dt_s must be finite and non-negative")
+            step = self._pinch_max_joint_velocity * min(dt_s, 0.1)
+            if step == 0:
+                return init_qpos.copy()
+            lower = np.maximum(lower, init_qpos - step)
+            upper = np.minimum(upper, init_qpos + step)
+        for i, value in self._fixed_joint_pose.items():
+            lower[i] = upper[i] = init_qpos[i] = value
+        # Capture the preceding emitted robot pose, before direct IP tracking
+        # changes init_qpos. Prepare once per advancing frame, never inside an
+        # objective/diagnostic: repeated evaluations must see the same goal.
+        target_pinch_vectors, surface_targets_cm = self._prepare_pinch_targets(
+            keypoints, init_qpos, alphas, target_pinch_vectors,
+        )
+        taught = None
+        if self._taught_contacts is not None:
+            taught = self._taught_contacts.target(
+                keypoints, init_qpos, self._pinch_d1, self._pinch_d2, self._pinch_pair_weights,
+            )
+        self._last_taught_target = taught
+        if taught is not None:
+            # A confirmed physical contact may have a nonzero nominal-FK gap.
+            # Move the pair's virtual target toward that recorded gap rather
+            # than competing with an incorrect zero-distance model target.
+            reference_q = init_qpos.copy()
+            reference_q[taught.indices] = taught.angles
+            pos, _ = self._robot.compute_positions_and_jacobians(
+                self._full_model_qpos(reference_q), self._computed_frame_indices, self._contact_offsets,
+            )
+            tips = pos[self._tip_indices]
+            pair = FINGERS[1:].index(taught.finger)
+            reference_vector = (tips[pair+1] - tips[0]) * M_TO_CM
+            target_pinch_vectors[pair] = (
+                (1-taught.strength)*target_pinch_vectors[pair] + taught.strength*reference_vector
+            )
+            if taught.strength >= 1-1e-12:
+                # Only thumb + participating finger are fixed, inside the
+                # existing per-frame velocity and ROM bounds. No post-solve
+                # angle overwrite or extrapolation beyond a measured pose.
+                goal = np.clip(taught.angles, lower[taught.indices], upper[taught.indices])
+                lower[taught.indices] = upper[taught.indices] = goal
+                init_qpos[taught.indices] = goal
+        direct_free = self._thumb_ip_tracking == "direct_free" and not (
+            self._w_pinch > 0 and np.any((alphas[1:] > 0) & (self._pinch_pair_weights > 0))
+        )
+        continuous_ip_release = (self._thumb_ip_tracking == "direct_free"
+                                 and (self._pinch_target_mode == "entry_anchored"
+                                      or self._pinch_objective == "relative_vector"))
+        if direct_free or continuous_ip_release:
+            i = self._thumb_ip_index
+            desired = (init_qpos[i] if thumb_ip_bend is None else
+                       thumb_ip_bend - self._thumb_ip_rest_bend)
+            target = float(np.clip(desired, lower[i], upper[i]))
+            # Legacy direct_free fixes IP outside pinch. With anchored or
+            # relative-vector goals, widen its interval continuously,
+            # rather than switching from fixed to fully free at alpha > 0.
+            # Interpolate *inside* this frame's ROM/velocity bounds, without
+            # changing the measured bend goal or overwriting the solved pose.
+            release = 0.0
+            if continuous_ip_release:
+                enabled = self._pinch_pair_weights > 0
+                activation = np.max(np.where(enabled, alphas[1:], 0))
+                activation = np.clip(activation / max(self._pinch_alpha_max, 1e-8), 0, 1)
+                release = activation**2 * (3-2*activation)
+            lower[i] = target + release * (lower[i]-target)
+            upper[i] = target + release * (upper[i]-target)
+            init_qpos[i] = np.clip(init_qpos[i], lower[i], upper[i])
+        opt.set_lower_bounds(lower.tolist())
+        opt.set_upper_bounds(upper.tolist())
+        self._last_solve_pinch_vectors = target_pinch_vectors.copy()
+        self._last_solve_alphas = alphas.copy()
+        self._last_solve_surface_targets_cm = (
+            None if surface_targets_cm is None else surface_targets_cm.copy()
+        )
 
         def objective(x, grad_out):
             loss, grad = self._loss_and_grad(
@@ -519,6 +1043,10 @@ class AdaptiveAnalyticalRetargeter:
                 target_full_hand_vectors,
                 alphas,
                 reg_qpos,
+                target_pinch_vectors,
+                thumb_ip_bend,
+                taught,
+                surface_targets_cm,
             )
             if grad_out.size > 0:
                 grad_out[:] = grad
@@ -527,9 +1055,21 @@ class AdaptiveAnalyticalRetargeter:
         opt.set_min_objective(objective)
         try:
             result = np.asarray(opt.optimize(init_qpos.tolist()), dtype=np.float64)
-        except RuntimeError:
+            self._solver_status = opt.last_optimize_result()
+            if not np.isfinite(result).all():
+                raise RuntimeError('optimizer returned nonfinite joint angles')
+        except RuntimeError as exc:
             result = init_qpos
-        result = np.clip(result, self._lower_phys, self._upper_phys)
+            self._solver_status = opt.last_optimize_result()
+            self._solver_failures += 1
+            now = time.monotonic()
+            if now - self._last_solver_warning_s >= 1:
+                self._last_solver_warning_s = now
+                held_loss = objective(init_qpos, np.empty(0))
+                logger.warning('Retarget solve failed; holding previous pose | failures=%d | '
+                               'status=%s | initial_loss=%.6g | held_loss=%.6g | error=%s',
+                               self._solver_failures, self._solver_status, held_loss, held_loss, exc)
+        result = np.clip(result, lower, upper)
         self._last_qpos_phys = result.copy()
         return result
 
@@ -553,7 +1093,9 @@ class AdaptiveAnalyticalRetargeter:
 
     def _full_model_qpos(self, qpos_phys: np.ndarray) -> np.ndarray:
         qpos = np.zeros(self._robot.nq, dtype=np.float64)
-        qpos[self._model_q_indices_np] = physical_to_model(qpos_phys, self._ref_offsets)
+        # Local AM200 convention: the simulator receives theta + ref and
+        # applies qpos - ref, so URDF FK must evaluate theta.
+        qpos[self._model_q_indices_np] = qpos_phys
         return qpos
 
     def _compute_pinch_alpha(self, keypoints: np.ndarray) -> np.ndarray:
@@ -563,16 +1105,47 @@ class AdaptiveAnalyticalRetargeter:
         alphas_4 = np.clip(
             (self._pinch_d2 - distances) / (self._pinch_d2 - self._pinch_d1 + 1e-8),
             0.0,
-            0.7,
+            self._pinch_alpha_max,
         )
+        alphas_4[self._fixed_fingers[1:]] = 0
+        if self._pinch_objective == "relative_vector":
+            alphas_4[self._pinch_pair_weights <= 0] = 0
         return np.concatenate([[float(np.max(alphas_4))], alphas_4])
+
+    def _compute_pinch_vectors(self, keypoints: np.ndarray) -> np.ndarray:
+        """Thumb-tip -> fingertip targets that collapse to contact below ``d1``.
+
+        Matching each tip to the palm separately cannot close a pinch: the
+        robot's thumb sits elsewhere relative to its palm than a human's, so
+        the tips stay apart. Targeting the thumb-to-finger vector itself does.
+        """
+        thumb_tip = keypoints[_MP_TIP_INDICES[0]]
+        vectors = (keypoints[_MP_TIP_INDICES[1:]] - thumb_tip) * M_TO_CM
+        distances = np.linalg.norm(vectors, axis=1)
+        shrink = np.clip(
+            (distances - self._pinch_d1) / (self._pinch_d2 - self._pinch_d1), 0.0, 1.0
+        )
+        if not self._pinch_smooth_transition:
+            return vectors * shrink[:, None]
+        # Cubic Hermite distance mapping: zero slope at contact (d1),
+        # identity value AND slope at free motion (d2). Multiplying d by
+        # smoothstep alone does not specify the robot's target gap directly.
+        width = self._pinch_d2 - self._pinch_d1
+        t = shrink
+        mapped = self._pinch_d2 * (3 * t**2 - 2 * t**3) + width * (t**3 - t**2)
+        target_distance = np.where(distances >= self._pinch_d2, distances, mapped)
+        direction = vectors / np.maximum(distances[:, None], 1e-12)
+        return direction * target_distance[:, None]
 
     def _target_palm(self, keypoints: np.ndarray) -> np.ndarray:
         return 0.5 * (keypoints[1] + keypoints[17])
 
     def _compute_tip_vectors(self, keypoints: np.ndarray) -> np.ndarray:
         palm = self._target_palm(keypoints)
-        return ((keypoints[_MP_TIP_INDICES] - palm) * self._scaling * M_TO_CM).astype(np.float64)
+        targets = ((keypoints[_MP_TIP_INDICES] - palm) * self._scaling * M_TO_CM).astype(np.float64)
+        if self._long_finger_tracking == "bone_directions":
+            targets[1:] = self._long_finger_shape_targets(keypoints)[-1]
+        return targets
 
     def _compute_tip_dirs(self, keypoints: np.ndarray) -> np.ndarray:
         vectors = keypoints[_MP_TIP_INDICES] - keypoints[_MP_DIP_INDICES]
@@ -584,7 +1157,30 @@ class AdaptiveAnalyticalRetargeter:
         pip_vectors = (keypoints[_MP_PIP_INDICES] - palm) * self._segment_scaling[:, 0:1]
         dip_vectors = (keypoints[_MP_DIP_INDICES] - palm) * self._segment_scaling[:, 1:2]
         tip_vectors = (keypoints[_MP_TIP_INDICES] - palm) * self._segment_scaling[:, 2:3]
-        return np.vstack([pip_vectors, dip_vectors, tip_vectors]) * M_TO_CM
+        targets = np.stack([pip_vectors, dip_vectors, tip_vectors]) * M_TO_CM
+        if self._long_finger_tracking == "bone_directions":
+            targets[:, 1:] = self._long_finger_shape_targets(keypoints)
+        return targets.reshape(15, 3)
+
+    def _long_finger_shape_targets(self, keypoints: np.ndarray) -> np.ndarray:
+        """Feasible MCP-relative chains; preserve the working thumb targets.
+
+        Global hand scale belongs to inter-finger pinch distances. Reusing it
+        for each palm-relative chain can ask a straight, short robot finger
+        to fold towards a shorter human target. Copy segment directions onto
+        the robot's own bases/lengths instead. In v1 PIP and DIP frame origins
+        coincide: their zero-length segment stays zero rather than pulling
+        one robot hinge towards two different human joints.
+        """
+        chain = np.stack([keypoints[indices] for indices in
+                          (_MP_TIP_INDICES-3, _MP_PIP_INDICES,
+                           _MP_DIP_INDICES, _MP_TIP_INDICES)], axis=1)[1:]
+        bones = np.diff(chain, axis=1)
+        norms = np.linalg.norm(bones, axis=2, keepdims=True)
+        directions = bones / np.maximum(norms, 1e-12)
+        segments = directions * self._shape_bone_lengths[1:, :, None]
+        targets = np.cumsum(segments, axis=1)
+        return targets.transpose(1, 0, 2) * M_TO_CM
 
     def _robot_palm_from_positions(self, positions_m: np.ndarray) -> np.ndarray:
         return (
@@ -598,6 +1194,54 @@ class AdaptiveAnalyticalRetargeter:
             - MANO_OFFSET_CM
         )
 
+    def _surface_contact_targets_cm(self, target_pinch_vectors, alphas):
+        """Continuous clearance goals; extra closure fades out on release."""
+        activation = np.clip(alphas[1:] / max(self._pinch_alpha_max, 1e-8), 0, 1)
+        closure = activation**2 * (3-2*activation)
+        return (self._surface_contacts.biases * M_TO_CM
+                + np.linalg.norm(target_pinch_vectors, axis=1)
+                - self._surface_contact_closure_margin_cm * closure)
+
+    def _prepare_pinch_targets(self, keypoints, previous_qpos, alphas, vectors):
+        """Freeze geometric goals from the robot's pinch-entry configuration.
+
+        Human distance controls progress, not the robot's absolute clearance.
+        Both the relative tip vector and the skin goal start at the same FK
+        pose. The entry is retained during a hold/reversal and cleared only on
+        release beyond d2; otherwise repeated frames would ratchet the target.
+        The endpoint remains the calibrated bias minus the configured margin.
+        This makes the *reference* monotone on approach when starting outside
+        contact, not a guarantee of monotone total IK motion or real contact.
+        """
+        if self._surface_contacts is None:
+            return vectors, None
+        goals = self._surface_contact_targets_cm(vectors, alphas)
+        if self._pinch_target_mode != "entry_anchored":
+            return vectors, goals
+        active = (alphas[1:] > 0) & (self._pinch_pair_weights > 0)
+        self._pinch_entry_vectors_cm[~active] = np.nan
+        self._pinch_entry_clearance_cm[~active] = np.nan
+        entering = active & ~np.isfinite(self._pinch_entry_clearance_cm)
+        if np.any(entering):
+            positions, _ = self._robot.compute_positions_and_jacobians(
+                self._full_model_qpos(previous_qpos), self._computed_frame_indices,
+                self._contact_offsets,
+            )
+            tips = positions[self._tip_indices]
+            self._pinch_entry_vectors_cm[entering] = ((tips[1:]-tips[0]) * M_TO_CM)[entering]
+            pairs = np.flatnonzero(entering)
+            clearance, _ = self._surface_contacts.distances(pairs, with_jacobian=False)
+            self._pinch_entry_clearance_cm[pairs] = clearance * M_TO_CM
+        distances = np.linalg.norm(keypoints[_MP_TIP_INDICES[1:]]-keypoints[4], axis=1) * M_TO_CM
+        progress = np.clip((self._pinch_d2-distances)/(self._pinch_d2-self._pinch_d1), 0, 1)
+        closure = progress**2 * (3-2*progress)
+        targets = vectors.copy()
+        targets[active] = (1-closure[active, None]) * self._pinch_entry_vectors_cm[active]
+        endpoint = self._surface_contacts.biases * M_TO_CM - self._surface_contact_closure_margin_cm
+        goals[active] = ((1-closure[active]) * self._pinch_entry_clearance_cm[active]
+                         + closure[active] * endpoint[active])
+        return targets, goals
+
     def _loss_and_grad(
         self,
         qpos_phys: np.ndarray,
@@ -606,6 +1250,10 @@ class AdaptiveAnalyticalRetargeter:
         target_full_hand_vectors: np.ndarray,
         alphas: np.ndarray,
         reg_qpos: np.ndarray | None,
+        target_pinch_vectors: np.ndarray | None = None,
+        thumb_ip_bend: float | None = None,
+        taught_contact=None,
+        surface_targets_cm: np.ndarray | None = None,
     ) -> tuple[float, np.ndarray]:
         qpos_full = self._full_model_qpos(qpos_phys)
         positions, jacobians = self._robot.compute_positions_and_jacobians(
@@ -625,10 +1273,39 @@ class AdaptiveAnalyticalRetargeter:
         j_tip = jacobians_cm[self._tip_indices]
         j_pip = jacobians_cm[self._pip_indices]
         j_dip = jacobians_cm[self._dip_indices]
+        shape_origins = np.repeat(palm_pos[None, :], len(FINGERS), axis=0)
+        j_shape_origins = np.repeat(j_palm[None, :, :], len(FINGERS), axis=0)
+        if self._long_finger_tracking == "bone_directions":
+            # Use the *current* own MCP origin/Jacobian, not a frozen base:
+            # the v1 base also translates as abduction rotates its offset.
+            shape_origins[1:] = positions_cm[self._base_indices[1:]]
+            j_shape_origins[1:] = jacobians_cm[self._base_indices[1:]]
 
         total_grad = np.zeros_like(qpos_phys, dtype=np.float64)
 
-        robot_tip_vec = tip_pos - palm_pos
+        # A human palm-to-tip position can conflict with a robot's achievable
+        # pinch location. Smoothly release only this absolute tip objective for
+        # the involved fingers (including the shared thumb). Keep direction,
+        # temporal regularization and other fingers. The relative-vector
+        # mode also releases the conflicting full-chain position objectives.
+        # Identical rule for all four pairs; no angle or per-finger correction.
+        position_weights = alphas
+        full_hand_weights = 1.0 - alphas
+        if (self._pinch_relax_tip_position or self._pinch_objective == "relative_vector") and self._w_pinch > 0:
+            active = np.clip(alphas[1:] / max(self._pinch_alpha_max, 1e-8), 0, 1)
+            active = np.where(self._pinch_pair_weights > 0, active, 0)
+            active = active**2 * (3 - 2 * active)
+            release = np.concatenate(([float(active.max())], active))
+            position_weights = alphas * (1 - release)
+            if self._pinch_objective == "relative_vector":
+                # Releasing only the separate tip objective leaves the full
+                # chain's palm-relative tip/PIP/DIP positions pulling the same
+                # pinching fingers elsewhere. Use complementary shape/pinch
+                # priorities, while keeping distal orientation and temporal
+                # regularization. Uninvolved/disabled fingers stay unchanged.
+                full_hand_weights = (1.0 - alphas) * (1.0 - release)
+
+        robot_tip_vec = tip_pos - shape_origins
         diff_pos = robot_tip_vec - target_tip_vectors
         dist_pos = np.linalg.norm(diff_pos, axis=1)
         loss_tip_pos = _huber_loss(dist_pos, self._huber_delta)
@@ -636,12 +1313,24 @@ class AdaptiveAnalyticalRetargeter:
         diff_normed_pos = diff_pos / (dist_pos[:, None] + 1e-8)
 
         for i in range(len(FINGERS)):
-            j_diff = j_tip[i] - j_palm
-            total_grad += alphas[i] * self._w_pos * grad_pos[i] * (diff_normed_pos[i] @ j_diff)
+            j_diff = j_tip[i] - j_shape_origins[i]
+            total_grad += position_weights[i] * self._w_pos * grad_pos[i] * (diff_normed_pos[i] @ j_diff)
 
         robot_tip_dir_vec = tip_pos - dip_pos
         robot_tip_dir_norm = np.linalg.norm(robot_tip_dir_vec, axis=1, keepdims=True)
         robot_tip_dirs = robot_tip_dir_vec / (robot_tip_dir_norm + 1e-8)
+        direction_weights = alphas.copy()
+        if self._long_finger_tracking == "bone_directions":
+            # A short robot finger can reduce a palm-position residual by
+            # folding even when the operator's finger is straight. Distal
+            # direction must also constrain free motion, not only a pinch.
+            # Preserve the working thumb rule and its direct IP tracking.
+            activation = np.clip(alphas[1:] / max(self._pinch_alpha_max, 1e-8), 0, 1)
+            free = 1.0 - activation**2 * (3-2*activation)
+            # At a fully closed pinch retain exactly the established
+            # orientation weight; the added free-motion term vanishes.
+            direction_weights[1:] += (1.0-alphas[1:]) * free
+        direction_weights[self._fixed_fingers] = 0
         diff_dir = robot_tip_dirs - target_tip_dirs
         dist_dir = np.linalg.norm(diff_dir, axis=1)
         loss_tip_dir = _huber_loss(dist_dir, self._huber_delta_dir)
@@ -654,16 +1343,17 @@ class AdaptiveAnalyticalRetargeter:
             j_norm = (np.eye(3) - np.outer(unit_dir, unit_dir)) / (norm + 1e-8)
             j_diff = j_tip[i] - j_dip[i]
             total_grad += (
-                alphas[i] * self._w_dir * grad_dir[i] * (diff_normed_dir[i] @ j_norm @ j_diff)
+                direction_weights[i] * self._w_dir * grad_dir[i]
+                * (diff_normed_dir[i] @ j_norm @ j_diff)
             )
 
         target_pip = target_full_hand_vectors[:5]
         target_dip = target_full_hand_vectors[5:10]
         target_tip = target_full_hand_vectors[10:15]
 
-        diff_pip = (pip_pos - palm_pos) - target_pip
-        diff_dip = (dip_pos - palm_pos) - target_dip
-        diff_tip = (tip_pos - palm_pos) - target_tip
+        diff_pip = (pip_pos - shape_origins) - target_pip
+        diff_dip = (dip_pos - shape_origins) - target_dip
+        diff_tip = (tip_pos - shape_origins) - target_tip
 
         dist_pip = np.linalg.norm(diff_pip, axis=1)
         dist_dip = np.linalg.norm(diff_dip, axis=1)
@@ -683,19 +1373,121 @@ class AdaptiveAnalyticalRetargeter:
         diff_normed_tip = diff_tip / (dist_tip[:, None] + 1e-8)
 
         for i in range(len(FINGERS)):
-            grad_coeff = (1.0 - alphas[i]) * self._w_full_hand / 3.0
-            total_grad += grad_coeff * grad_pip[i] * (diff_normed_pip[i] @ (j_pip[i] - j_palm))
-            total_grad += grad_coeff * grad_dip[i] * (diff_normed_dip[i] @ (j_dip[i] - j_palm))
-            total_grad += grad_coeff * grad_tip_full[i] * (diff_normed_tip[i] @ (j_tip[i] - j_palm))
+            grad_coeff = full_hand_weights[i] * (not self._fixed_fingers[i]) * self._w_full_hand / 3.0
+            total_grad += grad_coeff * grad_pip[i] * (diff_normed_pip[i] @ (j_pip[i] - j_shape_origins[i]))
+            total_grad += grad_coeff * grad_dip[i] * (diff_normed_dip[i] @ (j_dip[i] - j_shape_origins[i]))
+            total_grad += grad_coeff * grad_tip_full[i] * (diff_normed_tip[i] @ (j_tip[i] - j_shape_origins[i]))
 
         loss_tip_dir_vec = self._w_pos * loss_tip_pos + self._w_dir * loss_tip_dir
         loss_full = self._w_full_hand * loss_full_hand
-        total_loss = float(np.sum(alphas * loss_tip_dir_vec + (1.0 - alphas) * loss_full))
+        total_loss = float(np.sum((~self._fixed_fingers)
+                                 * (alphas * loss_tip_dir_vec + full_hand_weights * loss_full)))
+        if (self._pinch_relax_tip_position or self._pinch_objective == "relative_vector") and self._w_pinch > 0:
+            total_loss += float(np.sum((position_weights - alphas) * self._w_pos * loss_tip_pos))
+        total_loss += float(np.sum((direction_weights-alphas*(~self._fixed_fingers))
+                                   * self._w_dir * loss_tip_dir))
+
+        if self._w_pinch_proximal_dir > 0 and self._w_pinch > 0:
+            # Distal direction alone allows MCP to over-flex while PIP opens.
+            # Keep the live MCP->PIP direction during pinch as well. Targets
+            # are unit directions, not absolute tip positions or fixed angles.
+            # Only enabled, non-fixed long fingers with an active pinch enter
+            # this term; free motion and the thumb's own objectives are intact.
+            for i in range(1, len(FINGERS)):
+                if self._fixed_fingers[i] or self._pinch_pair_weights[i-1] <= 0:
+                    continue
+                weight = self._w_pinch_proximal_dir * alphas[i]
+                if weight <= 0:
+                    continue
+                bone = pip_pos[i]-positions_cm[self._base_indices[i]]
+                length = np.linalg.norm(bone)
+                target_length = np.linalg.norm(target_pip[i])
+                if length < 1e-8 or target_length < 1e-8:
+                    continue
+                direction = bone/length
+                error = direction-target_pip[i]/target_length
+                distance = np.linalg.norm(error)
+                j_direction = (np.eye(3)-np.outer(direction, direction))/length
+                j_bone = j_pip[i]-jacobians_cm[self._base_indices[i]]
+                total_loss += float(weight * _huber_loss(distance, self._huber_delta_dir))
+                total_grad += (weight * _huber_grad(distance, self._huber_delta_dir)
+                    * (error/max(distance, 1e-12) @ j_direction @ j_bone))
+
+        if self._w_pinch > 0.0 and target_pinch_vectors is not None:
+            pinch_weights = alphas[1:]
+            if self._pinch_smooth_transition:
+                activation = np.clip(pinch_weights / max(self._pinch_alpha_max, 1e-8), 0.0, 1.0)
+                pinch_weights = self._pinch_alpha_max * activation**2 * (3.0 - 2.0 * activation)
+            pinch_weights = pinch_weights * self._pinch_pair_weights
+            vector_weights = pinch_weights
+            if self._surface_contacts is not None:
+                # Replace point coincidence smoothly with an empirical skin
+                # clearance constraint. No joint angle/pose target is added.
+                blend = np.clip(alphas[1:] / max(self._pinch_alpha_max, 1e-8), 0, 1)
+                blend = blend**2 * (3-2*blend)
+                vector_weights = pinch_weights * (1-blend)
+                surface_weights = pinch_weights * blend
+                pairs = np.flatnonzero(surface_weights > 0)
+                if len(pairs):
+                    clearance, derivative = self._surface_contacts.distances(pairs)
+                    desired = (self._surface_contact_targets_cm(target_pinch_vectors, alphas)
+                               if surface_targets_cm is None else surface_targets_cm)[pairs]
+                    error = clearance * M_TO_CM - desired
+                    total_loss += self._w_pinch * float(np.sum(
+                        surface_weights[pairs] * _huber_loss(np.abs(error), self._huber_delta)))
+                    signed_grad = _huber_grad(np.abs(error), self._huber_delta) * np.sign(error)
+                    total_grad += self._w_pinch * np.sum(
+                        (surface_weights[pairs]*signed_grad)[:, None] * derivative * M_TO_CM, axis=0)
+            contact_pos, contact_jac = self._robot.frame_points(
+                self._computed_frame_indices, self._contact_offsets
+            )
+            contact_tips = contact_pos[self._tip_indices] * M_TO_CM
+            j_contact = contact_jac[self._tip_indices][:, :, self._model_q_indices_np] * M_TO_CM
+            diff_pinch = (contact_tips[1:] - contact_tips[0]) - target_pinch_vectors
+            dist_pinch = np.linalg.norm(diff_pinch, axis=1)
+            grad_pinch = _huber_grad(dist_pinch, self._huber_delta)
+            diff_normed_pinch = diff_pinch / (dist_pinch[:, None] + 1e-8)
+            for k in range(len(FINGERS) - 1):
+                total_grad += (
+                    vector_weights[k]
+                    * self._w_pinch
+                    * grad_pinch[k]
+                    * (diff_normed_pinch[k] @ (j_contact[k + 1] - j_contact[0]))
+                )
+            total_loss += self._w_pinch * float(
+                np.sum(vector_weights * _huber_loss(dist_pinch, self._huber_delta))
+            )
+
+        if (self._w_thumb_ip_bend > 0
+                and thumb_ip_bend is not None and self._thumb_ip_index is not None):
+            activation = 1.0
+            if self._thumb_ip_bend_scope in ("pinch", "free"):
+                active = np.where(self._pinch_pair_weights > 0, alphas[1:], 0)
+                activation = float(np.clip(active.max() / max(self._pinch_alpha_max, 1e-8), 0, 1))
+                activation = activation**2 * (3 - 2 * activation) if self._w_pinch > 0 else 0.0
+                if self._thumb_ip_bend_scope == "free":
+                    # Fade anatomical bend matching out as contact activates.
+                    # At full pinch the contact/posture solver owns the IP hinge.
+                    activation = 1.0 - activation
+            weight = self._w_thumb_ip_bend * activation
+            i = self._thumb_ip_index
+            error = qpos_phys[i] + self._thumb_ip_rest_bend - thumb_ip_bend
+            total_loss += weight * error**2
+            total_grad[i] += 2 * weight * error
 
         if reg_qpos is not None:
             diff_reg = qpos_phys - reg_qpos
             total_loss += self._norm_delta * float(np.sum(diff_reg**2))
             total_grad += 2.0 * self._norm_delta * diff_reg
+
+        if taught_contact is not None:
+            # A soft attraction during approach; at full closure _solve fixes
+            # these variables to the velocity-bounded measured contact pose.
+            idx = taught_contact.indices
+            error = qpos_phys[idx] - taught_contact.angles
+            weight = 1000.0 * taught_contact.strength**2
+            total_loss += weight * float(error @ error)
+            total_grad[idx] += 2*weight*error
 
         return total_loss, total_grad
 
@@ -735,6 +1527,14 @@ class _PinocchioOrcaRobot:
         self._pin.forwardKinematics(self.model, self.data, qpos)
         self._pin.computeJointJacobians(self.model, self.data, qpos)
         self._pin.updateFramePlacements(self.model, self.data)
+        return self.frame_points(frame_indices, frame_offsets)
+
+    def frame_points(
+        self,
+        frame_indices: list[int],
+        frame_offsets: list[np.ndarray] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Sample frames from the last ``compute_positions_and_jacobians`` pose."""
         if frame_offsets is None:
             frame_offsets = [np.zeros(3, dtype=np.float64) for _ in frame_indices]
 

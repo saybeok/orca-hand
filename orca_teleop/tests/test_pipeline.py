@@ -370,6 +370,36 @@ class _HomePoseHand:
         )
 
 
+def test_connect_orca_hand_supports_new_noninteractive_api():
+    from orca_teleop.pipeline import connect_orca_hand
+
+    class Hand:
+        interactive = None
+
+        def connect(self, interactive=True):
+            self.interactive = interactive
+            return True, "ok"
+
+    hand = Hand()
+    assert connect_orca_hand(hand) == (True, "ok")
+    assert hand.interactive is False
+
+
+def test_connect_orca_hand_supports_legacy_api():
+    from orca_teleop.pipeline import connect_orca_hand
+
+    class Hand:
+        called = False
+
+        def connect(self):
+            self.called = True
+            return True, "ok"
+
+    hand = Hand()
+    assert connect_orca_hand(hand) == (True, "ok")
+    assert hand.called
+
+
 def test_orca_hand_sink_go_home(monkeypatch):
     from types import SimpleNamespace
 
@@ -400,7 +430,10 @@ def test_orca_hand_sink_go_home(monkeypatch):
     sink.close()
 
     hand = instances[0]
-    assert hand.joint_calls == [({"wrist": 0.0, "thumb_mcp": 33.0}, 1)]
+    assert len(hand.joint_calls) == 1
+    pose, num_steps = hand.joint_calls[0]
+    assert pose.as_dict() == {"wrist": 0.0, "thumb_mcp": 33.0}
+    assert num_steps == 5
 
 
 def test_orca_hand_sink_go_home_skipped_without_hardware(monkeypatch):
@@ -591,17 +624,19 @@ def test_retargeter_preserves_webxr_landmarks_and_wrist_angle(monkeypatch):
         def retarget(self, target_pose):
             captured["keypoints"] = target_pose.joint_positions.copy()
             captured["wrist_angle_degrees"] = target_pose.wrist_angle_degrees
+            captured["timestamp_ns"] = target_pose.timestamp_ns
             return _midpoint_action()
 
     monkeypatch.setattr("orca_teleop.pipeline.Retargeter", _StubRetargeter)
 
     keypoints = plausible_hand_keypoints()
+    timestamp = time.time_ns()
     q = _make_queues()
     q.landmarks_q.put(
         HandLandmarks(
             keypoints=keypoints,
             handedness="right",
-            timestamp_ns=time.time_ns(),
+            timestamp_ns=timestamp,
             wrist_angle_degrees=17.5,
         )
     )
@@ -618,6 +653,7 @@ def test_retargeter_preserves_webxr_landmarks_and_wrist_angle(monkeypatch):
     assert not thread.is_alive()
     np.testing.assert_allclose(captured["keypoints"], keypoints)
     assert captured["wrist_angle_degrees"] == pytest.approx(17.5)
+    assert captured["timestamp_ns"] == timestamp
 
 
 def test_retargeter_worker_passes_backend_and_config(monkeypatch):

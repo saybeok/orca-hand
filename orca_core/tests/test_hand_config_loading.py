@@ -60,3 +60,23 @@ def test_write_yaml_atomic_exported_from_utils():
     from orca_core.utils.utils import write_yaml_atomic as impl
 
     assert write_yaml_atomic is impl
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), "bad"])
+def test_invalid_calibration_motor_travel_floor_is_rejected(tmp_path, value):
+    config_path = _touch_config_with_baudrate(tmp_path, 921600)
+    doc = yaml.safe_load(config_path.read_text())
+    doc["calibration_min_motor_span_rad"] = {doc["joint_ids"][0]: value}
+    config_path.write_text(yaml.safe_dump(doc))
+    with pytest.raises(HandConfigValidationError, match="calibration_min_motor_span_rad"):
+        OrcaHandConfig.from_config_path(config_path)
+
+
+def test_per_joint_motor_travel_floor_loads_in_motor_radians(tmp_path):
+    config_path = _touch_config_with_baudrate(tmp_path, 921600)
+    doc = yaml.safe_load(config_path.read_text())
+    joint = doc["joint_ids"][0]
+    doc["calibration_min_motor_span_rad"] = {joint: 1.8}
+    config_path.write_text(yaml.safe_dump(doc))
+    cfg = OrcaHandConfig.from_config_path(config_path)
+    assert cfg.calibration_min_motor_span_rad == {joint: 1.8}

@@ -35,7 +35,8 @@ action is passed through untouched, so the same runner still works hand-only.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -69,6 +70,35 @@ class ArmMappingConfig:
     # A jump larger than this between consecutive frames means tracking was
     # lost and re-acquired somewhere else; re-anchor instead of lunging.
     reanchor_jump_m: float = 0.25
+    # Optional command shaping; hardware shell wrappers enable it explicitly.
+    max_velocity_rad_s: float | None = None
+    max_acceleration_rad_s2: float | None = None
+
+    def __post_init__(self) -> None:
+        values = (self.max_velocity_rad_s, self.max_acceleration_rad_s2)
+        if (values[0] is None) != (values[1] is None):
+            raise ValueError("Arm velocity and acceleration limits must be supplied together")
+        if any(v is not None and (not np.isfinite(v) or v <= 0) for v in values):
+            raise ValueError("Arm motion limits must be finite and positive")
+
+
+class HoldArmActionComposer:
+    """Hand-only teleop in the 20-DoF schema; the arm holds its home pose."""
+
+    def __init__(self, joint_map: CanonicalJointMap) -> None:
+        self._map = joint_map
+
+    def reset(self) -> None:
+        pass
+
+    def __call__(
+        self,
+        frame: HandLandmarks,
+        hand_action: OrcaJointPositions,
+    ) -> RobotJointCommand:
+        canonical = np.zeros(self._map.dof, dtype=np.float64)
+        canonical[self._map.hand_slice] = self._map.hand_from_physical(hand_action)
+        return RobotJointCommand.now(self._map.roles, self._map.clip(canonical))
 
 
 class Am200ActionComposer:
@@ -94,6 +124,9 @@ class Am200ActionComposer:
         self._engaged = False
         self._align = self._alignment(arm_ik)
         self._unreachable_logged = False
+        self._arm_velocity = np.zeros_like(self._arm_q)
+        self._last_motion_ns: int | None = None
+        self._reanchor_after_return = False
 
         # Default teleop is first-frame relative follow. A calibration file is
         # optional absolute mapping for reproducible recording; absence is normal.
@@ -113,13 +146,15 @@ class Am200ActionComposer:
         config: ArmMappingConfig | None = None,
         site_name: str = FLANGE_SITE,
         calibration: OperatorCalibration | None = None,
+        hand_config_path: str | Path | None = None,
     ) -> Am200ActionComposer:
         import mujoco
 
         model_path = Path(model_path)
         model = mujoco.MjModel.from_xml_path(str(model_path))
         joint_map = CanonicalJointMap.load(
-            joint_map_path or model_path.parent / "joint_map.json", model
+            joint_map_path or model_path.parent / "joint_map.json", model,
+            hand_config_path=hand_config_path,
         )
         return cls(joint_map, ArmIk(model, site_name=site_name), config, calibration)
 
@@ -145,8 +180,24 @@ class Am200ActionComposer:
         return np.column_stack([forward, left, up])
 
     @property
+    def joint_map(self) -> CanonicalJointMap:
+        return self._map
+
+    @property
     def arm_position(self) -> np.ndarray:
         return self._arm_q.copy()
+
+    def set_arm_limits(self, lower, upper) -> None:
+        self._ik.constrain_limits(lower, upper)
+        lower, upper = self._ik.limits
+        map_lower, map_upper = self._map.lower.copy(), self._map.upper.copy()
+        map_lower[self._map.arm_slice], map_upper[self._map.arm_slice] = lower, upper
+        self._map = replace(self._map, lower=map_lower, upper=map_upper)
+        self._arm_q = np.clip(self._arm_q, lower, upper)
+        self.reset()
+        logger.info('Arm IK firmware bounds_deg: lower=%s upper=%s',
+                    np.round(np.rad2deg(lower), 2).tolist(),
+                    np.round(np.rad2deg(upper), 2).tolist())
 
     def reset(self) -> None:
         """Start a new episode: drop any clutch drift and restore the mapping.
@@ -160,6 +211,8 @@ class Am200ActionComposer:
         self._flange_anchor = None
         self._last_operator = None
         self._engaged = False
+        self._arm_velocity[:] = 0
+        self._last_motion_ns = None
 
     def __call__(
         self,
@@ -167,18 +220,39 @@ class Am200ActionComposer:
         hand_action: OrcaJointPositions,
     ) -> RobotJointCommand | OrcaJointPositions:
         if frame.wrist_transform is None:
+            self._pause_motion()
             return hand_action
 
         wrist = np.asarray(frame.wrist_transform, dtype=np.float64)[:3, 3]
         if not np.all(np.isfinite(wrist)):
+            self._pause_motion()
             return hand_action
 
         # A publisher with no clutch means follow unconditionally; a released
         # clutch means hold. The hand keeps moving either way, so releasing
         # parks the arm without freezing the fingers.
+        if frame.clutch_released:
+            self._pause_motion()
         if frame.clutch_supported and not frame.clutch_engaged:
-            self._engaged = False
+            self._pause_motion()
             return self._command(hand_action)
+
+        if self._reanchor_after_return:
+            self._anchor(wrist)
+            self._reanchor_after_return = False
+
+        dt = 1.0 / 30.0
+        if self._config.max_velocity_rad_s is not None:
+            now = int(frame.timestamp_ns) if frame.timestamp_ns > 0 else time.monotonic_ns()
+            if self._last_motion_ns is not None:
+                if now <= self._last_motion_ns:
+                    return self._command(hand_action)
+                dt = (now - self._last_motion_ns) * 1e-9
+                if dt > 0.2:
+                    # A tracking gap must not spend the missing time moving.
+                    self._anchor(wrist)
+                    dt = 0.0
+            self._last_motion_ns = now
 
         if not self._engaged:
             self._engaged = True
@@ -190,7 +264,7 @@ class Am200ActionComposer:
 
         target = self._flange_target(wrist)
         result = self._ik.solve(target, seed=self._arm_q)
-        self._arm_q = result.position
+        self._advance_arm(result.position, dt)
 
         if not result.converged and not self._unreachable_logged:
             logger.info(
@@ -203,6 +277,49 @@ class Am200ActionComposer:
             self._unreachable_logged = False
 
         return self._command(hand_action)
+
+    def _pause_motion(self) -> None:
+        self._engaged = False
+        self._arm_velocity[:] = 0
+        self._last_motion_ns = None
+
+    def reset_arm_position(self, position: np.ndarray) -> None:
+        """Synchronize IK after a separately commanded return; keep the data zero."""
+        position = np.asarray(position, dtype=float)
+        if position.shape != self._arm_q.shape or not np.isfinite(position).all():
+            raise ValueError('Returned arm position must contain three finite model angles')
+        self._arm_q = position.copy()
+        self.reset()
+        self._reanchor_after_return = True
+
+    def _advance_arm(self, target: np.ndarray, dt: float) -> None:
+        """Track IK with a damped second-order reference, not per-frame clipping.
+
+        Integrate small substeps for stable behaviour across acquisition rates.
+        Bounds apply to the joint command velocity/acceleration, not measured
+        hardware motion. Clutch/tracking stops and joint stops override the
+        acceleration bound to hold immediately.
+        """
+        config = self._config
+        if config.max_velocity_rad_s is None:
+            self._arm_q = target.copy()
+            return
+        if dt <= 0:
+            return
+        count = max(1, int(np.ceil(dt * 240.0)))
+        h = dt / count
+        lower, upper = self._ik.limits
+        for _ in range(count):
+            # Critical damping at omega=20 rad/s for the unsaturated reference.
+            accel = 400.0 * (target - self._arm_q) - 40.0 * self._arm_velocity
+            accel = np.clip(accel, -config.max_acceleration_rad_s2, config.max_acceleration_rad_s2)
+            velocity = np.clip(self._arm_velocity + h * accel,
+                               -config.max_velocity_rad_s, config.max_velocity_rad_s)
+            position = self._arm_q + 0.5 * h * (self._arm_velocity + velocity)
+            clipped = np.clip(position, lower, upper)
+            velocity[position != clipped] = 0.0
+            self._arm_q = clipped
+            self._arm_velocity = velocity
 
     def _command(self, hand_action: OrcaJointPositions) -> RobotJointCommand:
         canonical = np.empty(self._map.dof, dtype=np.float64)
@@ -259,6 +376,7 @@ class Am200ActionComposer:
         self._operator_origin = wrist.copy()
         self._flange_anchor = self._ik.flange_position(self._arm_q)
         self._last_operator = wrist.copy()
+        self._arm_velocity[:] = 0
 
     def _clamp_to_shell(self, target: np.ndarray) -> np.ndarray:
         lo = self._config.min_radius_m

@@ -8,7 +8,7 @@ Quest provides wrist pose for arm IK. Webcam has no wrist pose, so the arm
 holds the connect-time pose and only the hand follows.
 
 Examples:
-    python scripts/teleop_am200_hw.py --source quest --clutch --arm-scale 0.35
+    python scripts/teleop_am200_hw.py --source quest --clutch --arm-scale 0.35 --arm-max-step 0.3
     python scripts/teleop_am200_hw.py --source webcam --show-video --no-arm --no-mirror --camera-id 0
 """
 
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 
 from orca_teleop.am200 import (
@@ -47,22 +48,34 @@ def main() -> None:
     parser.add_argument("--quest-fps", type=int, default=30)
     parser.add_argument("--confidence", type=float, default=0.7)
     parser.add_argument("--show-video", action="store_true")
+    parser.add_argument("--visualize-landmarks", action="store_true",
+                        help="show the incoming hand skeleton and thumb bend angles before retargeting")
     parser.add_argument("--camera-id", type=int, default=None)
     parser.add_argument("--no-mirror", dest="mirror", action="store_false")
     parser.set_defaults(mirror=True)
     parser.add_argument(
         "--retargeter",
         default="adaptive_analytical",
-        choices=["rmsprop", "adaptive_analytical"],
+        choices=["rmsprop", "adaptive_analytical", "key_objectives", "dexpilot"],
     )
     parser.add_argument("--retarget-config", default=os.environ.get("ORCA_RETARGET_CONFIG"))
     parser.add_argument("--arm-scale", type=float, default=0.35)
+    parser.add_argument('--arm-max-velocity-deg-s', type=float, default=None)
+    parser.add_argument('--arm-max-acceleration-deg-s2', type=float, default=None)
+    parser.add_argument(
+        "--arm-max-step",
+        type=float,
+        default=None,
+        help="clip every arm joint to +/- this many rad from the connect-time pose",
+    )
     parser.add_argument(
         "--no-arm",
         action="store_true",
         help="do not open the arm bus; hand-only teleop",
     )
     parser.add_argument("--clutch", action="store_true")
+    parser.add_argument("--hand-feedback-debug", action="store_true",
+                        help="log all finger commands vs motor-encoder joint estimates once per second")
     parser.add_argument("--operator-cal", default=None)
     parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
@@ -84,13 +97,22 @@ def main() -> None:
         model_path=args.model_path,
         enable_arm=not args.no_arm,
         enable_hand=True,
+        arm_max_step_rad=args.arm_max_step,
+        hand_feedback_debug=args.hand_feedback_debug,
     )
 
     composer = None
     if not args.no_arm:
         composer = Am200ActionComposer.from_model_path(
             sink.model_path,
-            config=ArmMappingConfig(scale=args.arm_scale),
+            hand_config_path=args.hand_config,
+            config=ArmMappingConfig(
+                scale=args.arm_scale,
+                max_velocity_rad_s=(None if args.arm_max_velocity_deg_s is None
+                                    else math.radians(args.arm_max_velocity_deg_s)),
+                max_acceleration_rad_s2=(None if args.arm_max_acceleration_deg_s2 is None
+                                         else math.radians(args.arm_max_acceleration_deg_s2)),
+            ),
             calibration=OperatorCalibration.load(args.operator_cal),
         )
 
@@ -102,6 +124,7 @@ def main() -> None:
         retargeter_backend=args.retargeter,
         retargeter_config_path=args.retarget_config,
         action_composer=composer,
+        visualize_landmarks=args.visualize_landmarks,
     )
 
     if args.source == "quest":

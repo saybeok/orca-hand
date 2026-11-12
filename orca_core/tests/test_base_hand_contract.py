@@ -99,6 +99,14 @@ def test_partial_commands_preserve_unspecified_joints(hand):
     }
 
 
+def test_partial_interpolation_never_commands_other_joints(hand):
+    hand.state.update(joint_a=0.4, joint_c=-0.2)
+    hand.set_joint_positions({"joint_b": 1.5}, num_steps=4, step_size=0)
+    assert len(hand.command_log) == 5
+    assert all(set(command) == {"joint_b"} for command in hand.command_log)
+    assert hand.state == {"joint_a": 0.4, "joint_b": 1.5, "joint_c": -0.2}
+
+
 def test_get_joint_position_as_list_preserves_order(hand):
     hand.set_joint_positions({"joint_a": -0.1, "joint_b": 1.1, "joint_c": 0.2})
     assert hand.get_joint_position().as_list(hand.config.joint_ids) == [-0.1, 1.1, 0.2]

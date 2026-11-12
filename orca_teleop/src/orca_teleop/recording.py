@@ -61,6 +61,7 @@ class TeleopActionMirror:
 
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _latest: TeleopAction | None = None
+    _applied: TeleopAction | None = None
     _update_count: int = 0
 
     def update(self, action: TeleopAction) -> None:
@@ -72,6 +73,15 @@ class TeleopActionMirror:
         with self._lock:
             return self._latest
 
+    def mark_applied(self, action: TeleopAction) -> None:
+        with self._lock:
+            self._applied = action
+
+    def applied_snapshot(self) -> TeleopAction | None:
+        """Last successfully dispatched command, excluding warm-up candidates."""
+        with self._lock:
+            return self._applied
+
     @property
     def update_count(self) -> int:
         with self._lock:
@@ -80,6 +90,7 @@ class TeleopActionMirror:
     def reset(self) -> None:
         with self._lock:
             self._latest = None
+            self._applied = None
             self._update_count = 0
 
 
@@ -105,12 +116,11 @@ def teleop_consumer_loop(
         if not is_teleop_action(item):
             continue
         mirror.update(item)
-        if dispatch_action is None:
-            continue
         if dispatch_enabled is not None and not dispatch_enabled.is_set():
             continue
         try:
-            dispatch_action(item)
+            if dispatch_action is None or dispatch_action(item) is not False:
+                mirror.mark_applied(item)
         except Exception:
             logger.exception("Teleop dispatch failed")
 
@@ -176,7 +186,7 @@ def wait_for_teleop_mirror_ready(
         raise ValueError("readiness streaks must be >= 1")
 
     logger.info(
-        "Waiting for recording readiness: need %d consecutive teleop updates and "
+        "Waiting for recording readiness: need %d recent teleop updates and "
         "%d consecutive healthy observations.",
         min_action_streak,
         min_obs_streak,
@@ -185,15 +195,20 @@ def wait_for_teleop_mirror_ready(
     action_streak = 0
     obs_streak = 0
     last_status = time.monotonic()
+    last_action_update = last_status
+    action_timeout_s = max(1.0, heartbeat_interval * 3)
     last_obs_error: str | None = None
 
     while not stop_event.is_set():
         time.sleep(heartbeat_interval)
         update_count = mirror.update_count
         if update_count > seen_updates:
-            action_streak += 1
+            # Polling and publishing run on independent clocks. Count actual
+            # updates; an empty poll between healthy frames is not a failure.
+            action_streak += update_count - seen_updates
             seen_updates = update_count
-        else:
+            last_action_update = time.monotonic()
+        elif time.monotonic() - last_action_update > action_timeout_s:
             action_streak = 0
 
         try:
@@ -214,7 +229,8 @@ def wait_for_teleop_mirror_ready(
         obs_streak += 1
         last_obs_error = None
 
-        if action_streak >= min_action_streak and obs_streak >= min_obs_streak:
+        if (action_streak >= min_action_streak and obs_streak >= min_obs_streak
+                and time.monotonic() - last_action_update <= action_timeout_s):
             logger.info("Recording pipeline ready (teleop stream + observations healthy).")
             return True
 

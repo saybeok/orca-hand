@@ -83,6 +83,8 @@ def _print_progress(event: dict) -> None:
         print("Calibration complete.")
     elif name == "calibration_aborted":
         print("Calibration aborted.")
+    elif name == "calibration_isolation_failed":
+        print(f"Calibration stopped: torque OFF not acknowledged by motor IDs {event['motor_ids']}")
     elif name == "cleanup_failed":
         print(f"WARNING: cleanup after abort failed: {event['error']}")
 
@@ -178,6 +180,12 @@ def main():
         )
 
     joints = _resolve_joints(parser, args, hand.config.joint_ids)
+    selected = hand.config.joint_ids if joints is None else joints
+    print(f"Config: {hand.config_path}" if hasattr(hand, "config_path") else f"Config: {args.config_path}")
+    print("Calibration motor mapping: " + ", ".join(
+        f"{joint}=ID {hand.config.joint_to_motor_map[joint]}"
+        for joint in selected
+    ))
 
     status = hand.connect()
     print(status)
@@ -214,6 +222,9 @@ def main():
         )
     except KeyboardInterrupt:
         print("\nCalibration interrupted.")
+    except (ValueError, RuntimeError) as exc:
+        print(f"Calibration failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
     finally:
         if client is not None:
             try:

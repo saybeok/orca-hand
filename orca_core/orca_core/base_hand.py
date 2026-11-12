@@ -158,8 +158,8 @@ class BaseHand(ABC):
             out.append(
                 OrcaJointPositions.from_dict({
                     joint: current.data[joint] * (1 - t)
-                    + target.data.get(joint, current.data[joint]) * t
-                    for joint in current.data
+                    + target.data[joint] * t
+                    for joint in target.data
                 })
             )
         return out

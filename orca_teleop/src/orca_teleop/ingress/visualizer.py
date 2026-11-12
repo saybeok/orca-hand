@@ -53,6 +53,20 @@ class _VizFrame:
     handedness: str
 
 
+def thumb_bend_degrees(keypoints: np.ndarray) -> tuple[float | None, float | None]:
+    """Raw position-derived MCP and IP bend magnitudes, before retargeting."""
+    points = np.asarray(keypoints, dtype=np.float64)
+    if points.shape != (21, 3):
+        raise ValueError(f"Expected (21, 3) hand landmarks, got {points.shape}")
+    bends = []
+    for a, b, c in ((1, 2, 3), (2, 3, 4)):
+        first, second = points[b] - points[a], points[c] - points[b]
+        norm = float(np.linalg.norm(first) * np.linalg.norm(second))
+        bends.append(None if not np.isfinite(norm) or norm < 1e-12 else
+                     float(np.degrees(np.arccos(np.clip(first @ second / norm, -1, 1)))))
+    return tuple(bends)
+
+
 def _run_visualizer(q: mp.Queue) -> None:  # noqa: C901
     """Subprocess entry point: read keypoints from *q* and animate a 3D plot."""
     import matplotlib.pyplot as plt
@@ -75,6 +89,7 @@ def _run_visualizer(q: mp.Queue) -> None:  # noqa: C901
     (wrist_marker,) = ax.plot([], [], [], "s", color="black", markersize=6)
 
     ax.legend(loc="upper left", fontsize="small")
+    thumb_status = ax.text2D(.02, .02, "Waiting for thumb landmarks", transform=ax.transAxes)
 
     frame_count = 0
     t_start = time.perf_counter()
@@ -122,8 +137,12 @@ def _run_visualizer(q: mp.Queue) -> None:  # noqa: C901
         elapsed = time.perf_counter() - t_start
         fps = frame_count / elapsed if elapsed > 0 else 0.0
         ax.set_title(f"{last_frame.handedness.upper()} hand | frame {frame_count} | {fps:.1f} fps")
+        mcp, ip = thumb_bend_degrees(kp)
+        mcp_text = "unavailable" if mcp is None else f"{mcp:.1f} deg"
+        ip_text = "unavailable" if ip is None else f"{ip:.1f} deg"
+        thumb_status.set_text(f"RAW thumb MCP: {mcp_text} | IP (end joint): {ip_text}")
 
-        return list(finger_lines.values()) + [wrist_marker]
+        return list(finger_lines.values()) + [wrist_marker, thumb_status]
 
     _anim = FuncAnimation(fig, _update, interval=33, blit=False, cache_frame_data=False)  # noqa: F841
     plt.show()

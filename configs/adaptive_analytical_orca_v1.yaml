@@ -9,6 +9,9 @@ retarget:
   w_pos: 1.0
   w_dir: 10.0
   w_full_hand: 1.0
+  # Official baseline: disable the local contact objective.
+  w_pinch: 0.0
+  pinch_alpha_max: 0.7
   scaling: 1.0
 
   segment_scaling:

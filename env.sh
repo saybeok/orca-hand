@@ -18,3 +18,6 @@ export ORCAHAND_DESCRIPTION_DIR="$ORCA_HAND_ROOT/orcahand_description"
 export ORCA_MODEL_PATH="$ORCA_HAND_ROOT/configs/orcahand-right-v1-feetech/config.yaml"
 export ORCA_URDF_PATH="$ORCAHAND_DESCRIPTION_DIR/v1/models/urdf/orcahand_right.urdf"
 export ORCA_RETARGET_CONFIG="$ORCA_HAND_ROOT/configs/adaptive_analytical_orca_v1.yaml"
+
+# Confirmed camera roles and USB-port selectors shared by preview and recording.
+source "$ORCA_HAND_ROOT/configs/cameras.env"

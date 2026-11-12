@@ -629,6 +629,23 @@ class OrcaHand(BaseHand):
                 )
                 motors_with_warnings.add(motor_id)
 
+        for joint, min_span in self.config.calibration_min_motor_span_rad.items():
+            motor_id = self.config.joint_to_motor_map[joint]
+            limits = self.motor_limits_dict[motor_id]
+            if any(value is None for value in limits):
+                continue
+            span = limits[1] - limits[0]
+            if not math.isfinite(span) or span <= min_span:
+                overall_calibrated = False
+                if not verbose:
+                    return False
+                uncalibrated_messages.append(
+                    f"Warning: Motor ID {motor_id} (Joint: {joint}) motor travel "
+                    f"{span:.4f} rad does not exceed the configured minimum "
+                    f"{min_span:.4f} rad; calibration is incomplete."
+                )
+                motors_with_warnings.add(motor_id)
+
         for motor_id, ratio in self.calibration.joint_to_motor_ratios_dict.items():
             if ratio is None or ratio == 0.0:
                 overall_calibrated = False

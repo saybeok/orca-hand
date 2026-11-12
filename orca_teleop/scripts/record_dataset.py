@@ -9,6 +9,9 @@ Record — per episode:
     into one dataset row. Recording timing does not drive robot dispatch.
   - recorder thread: blocks on ``rec_q``, calls ``dataset.add_frame(...)`` for
     every dict, and ``dataset.save_episode()`` when it sees the SAVE sentinel
+  - default capture writer: a separate process stores JPEG-95 and joint rows;
+    the collector's conversion button builds verified LeRobot videos later.
+    --video-storage streaming/images retains live H.264 / PNG fallbacks.
   - episodes after the first begin with ``go_home()`` (reset to the recording home
     pose), rest (default 5 s) with no teleop dispatch, then sensor warmup and
     recording; episode 1 starts without homing; SPACE saves and advances; at
@@ -67,6 +70,12 @@ Example usage:
     python scripts/record_dataset.py --backend am200_sim --repo-id $HF_USERNAME/orca-am200 \\
         --task "reach and grasp" --local --source metaquest --hand right --clutch \\
         --episode-end space --num-episodes 20
+
+    # Physical AM-ARM200 + ORCA hand v1 from Quest (same 20-DoF schema as am200_sim)
+    python scripts/record_dataset.py --backend am200_hw --repo-id $HF_USERNAME/orca-am200-real \\
+        --task "pick up the card" --local --source metaquest --hand right --clutch \\
+        --arm-scale 0.35 --arm-max-step 0.3 \\
+        --episode-end space --num-episodes 20 --camera front:0
 """
 
 import argparse
@@ -93,12 +102,13 @@ from orca_teleop.constants import (
     DEFAULT_HAND,
     DEFAULT_PORT,
     JOIN_TIMEOUT,
-    QUEUES_MAXSIZE,
     SIM_RENDER_MODE,
 )
 from orca_teleop.ingress.server import IngressServer
+from orca_teleop.latest import LatestQueue
 from orca_teleop.pipeline import (
     _SHUTDOWN,
+    _configure_arm_limits,
     OrcaHandSink,
     RecordableSink,
     TeleopQueues,
@@ -126,6 +136,9 @@ _DEFAULT_FPS = 30
 _DEFAULT_NUM_EPISODES = 1
 _DEFAULT_EPISODE_SECONDS = 30.0
 _DEFAULT_REST_SECONDS = 5.0
+_IMAGE_WRITER_THREADS_PER_CAMERA = 4
+# Limit pending raw images as well as rec_q: LeRobot's writer queue is unbounded.
+_IMAGE_WRITER_BACKLOG_PER_CAMERA = 64
 
 # Sentinels pushed onto rec_q between episodes — the recorder either flushes
 # (save) or drops (discard) the in-progress episode buffer, then keeps draining.
@@ -216,6 +229,33 @@ def _parse_camera_configs(specs: list[str]) -> list[OpenCVCameraConfig]:
     return [with_recording_defaults(parse_camera_spec(spec)) for spec in specs]
 
 
+def _preview_observation(sink, control):
+    observation = sink.get_observation()
+    if control:
+        control.observe(observation)
+    return observation
+
+
+def _return_arm_for_collection(returner, control, mirror, queues, stop_event, reason):
+    """Return outside capture and require fresh commands before resuming."""
+    if stop_event.is_set():
+        return False
+    control.update(phase='returning', return_reason=reason, arm_home_saved=False)
+    returner.return_home()
+    mirror.reset()
+    drain_actions_queue(queues.actions_q, stop_event=stop_event, shutdown_sentinel=_SHUTDOWN)
+    if stop_event.is_set():
+        return False
+    if reason in ('save', 'discard'):
+        # The next trial has its own readiness gate. Finish parking even if
+        # the operator removes VR after saving or discarding the attempt.
+        return True
+    return wait_for_teleop_mirror_ready(
+        get_observation=lambda: _preview_observation(returner.sink, control),
+        mirror=mirror, stop_event=stop_event,
+    )
+
+
 def _stub_action_publisher(
     actions_q: "queue.Queue",
     stop_event: threading.Event,
@@ -257,12 +297,114 @@ def _stub_action_publisher(
         time.sleep(period)
 
 
+def _create_recording_dataset(dataset_class, *, repo_id, fps, features, root,
+                              video_storage='streaming'):
+    if video_storage == 'deferred':
+        from orca_teleop.capture_process import ProcessDeferredCapture
+        dataset = ProcessDeferredCapture(repo_id=repo_id, fps=fps, features=features,
+                                  root=root or _default_lerobot_root(repo_id))
+        logger.info('Video storage: deferred JPEG quality 95 in separate process pid=%d; '
+                    'LeRobot conversion after collection.', dataset.worker_pid)
+        return dataset
+    camera_count = sum(ft['dtype'] in ('image', 'video') for ft in features.values())
+    streaming = video_storage == 'streaming' and any(ft['dtype'] == 'video' for ft in features.values())
+    image_count = sum(ft['dtype'] == 'image' for ft in features.values()) if streaming else camera_count
+    threads = _IMAGE_WRITER_THREADS_PER_CAMERA * image_count
+    dataset = dataset_class.create(
+        repo_id=repo_id, fps=fps, features=features, root=root, use_videos=True,
+        image_writer_processes=0, image_writer_threads=threads,
+        **({'vcodec': 'h264', 'streaming_encoding': True, 'encoder_threads': 2,
+            'encoder_queue_maxsize': 30} if streaming else {}),
+    )
+    if streaming:
+        from orca_teleop.recording_storage import CheckedStreamingEncoder
+        dataset._streaming_encoder = CheckedStreamingEncoder(dataset._streaming_encoder, features, fps)
+        logger.info('Video storage: streaming H.264, %d cameras, 2 encoder threads/camera; '
+                    'frame drops invalidate the trial.', camera_count)
+    else:
+        logger.info('Image storage: %d cameras, %d asynchronous writer threads.', camera_count, threads)
+    return dataset
+
+
+def _check_image_writer_backlog(dataset):
+    encoder = getattr(dataset, '_streaming_encoder', None)
+    if encoder is not None:
+        encoder.check()
+    writer = getattr(dataset, 'image_writer', None)
+    if writer is None:
+        return
+    camera_count = sum(ft['dtype'] in ('image', 'video') for ft in dataset.features.values())
+    if writer.queue.qsize() >= _IMAGE_WRITER_BACKLOG_PER_CAMERA * max(camera_count, 1):
+        raise RuntimeError('이미지 저장 대기열이 계속 밀려 현재 시도를 폐기합니다. CPU·디스크 부하를 확인해 주세요.')
+
+
+def _validate_recorded_images(dataset):
+    """Catch swallowed LeRobot PNG write failures before committing episode metadata."""
+    from orca_teleop.deferred_recording import DeferredCapture
+    if isinstance(dataset, DeferredCapture):
+        dataset.prepare_episode()
+        return
+    encoder = getattr(dataset, '_streaming_encoder', None)
+    if encoder is not None:
+        encoder.prepare_episode(expected_frames=dataset.episode_buffer['size'])
+    writer = getattr(dataset, 'image_writer', None)
+    if writer is not None:
+        writer.wait_until_done()
+    image_features = {
+        key: ft for key, ft in getattr(dataset, 'features', {}).items()
+        if ft['dtype'] == 'image' or (ft['dtype'] == 'video' and encoder is None)
+    }
+    if not image_features:
+        return
+    from PIL import Image
+
+    buffer = dataset.episode_buffer
+    for key, ft in image_features.items():
+        paths = buffer[key]
+        if len(paths) != buffer['size']:
+            raise RuntimeError(f'{key}: 이미지 수와 데이터 프레임 수가 다릅니다.')
+        if paths and len(list(Path(paths[0]).parent.glob('frame-*.png'))) != buffer['size']:
+            raise RuntimeError(f'{key}: 이전 시도의 이미지가 남아 있거나 이미지가 누락되었습니다.')
+        for path in paths:
+            with Image.open(path) as image:
+                if image.size != (ft['shape'][1], ft['shape'][0]):
+                    raise RuntimeError(f'{key}: 저장된 이미지 해상도가 다릅니다: {path}')
+                image.verify()
+
+
+def _discard_recording_episode(dataset):
+    from orca_teleop.deferred_recording import DeferredCapture
+    if isinstance(dataset, DeferredCapture):
+        dataset.clear_episode_buffer()
+        return
+    writer = getattr(dataset, 'image_writer', None)
+    if writer is not None:
+        writer.wait_until_done()
+    directories = []
+    for key, ft in getattr(dataset, 'features', {}).items():
+        if ft['dtype'] == 'video':
+            index = int(np.asarray(dataset.episode_buffer['episode_index']).reshape(-1)[0])
+            directory = dataset._get_image_file_dir(index, key)
+            if not directory.resolve().is_relative_to((dataset.root / 'images').resolve()):
+                raise RuntimeError(f'Unexpected temporary image directory: {directory}')
+            directories.append(directory)
+    dataset.clear_episode_buffer()
+    # LeRobot 0.4.4 clears dtype=image files, but leaves temporary dtype=video
+    # PNGs on discard. A shorter retry must not encode the previous trial's tail.
+    for directory in directories:
+        if directory.is_dir():
+            shutil.rmtree(directory)
+
+
 def _recorder_loop(
     dataset,
     rec_q: "queue.Queue",
     episode_finalized_q: "queue.Queue[bool]",
+    failure_event: threading.Event | None = None,
 ) -> None:
     """Drain rec_q. Frames are dicts; save/discard sentinels finalize; ``None`` exits."""
+    episode_failed = False
+    last_backlog_warning = -float('inf')
     while True:
         item = rec_q.get()
         if item is None:
@@ -270,29 +412,58 @@ def _recorder_loop(
         if item is _SAVE_EPISODE:
             succeeded = False
             try:
-                dataset.save_episode()
-                logger.info("Episode saved.")
-                succeeded = True
+                if episode_failed:
+                    _discard_recording_episode(dataset)
+                    logger.error('Refusing to save an episode after a frame write failure.')
+                else:
+                    started = time.perf_counter()
+                    _validate_recorded_images(dataset)
+                    logger.info('Episode image/queue validation completed in %.2f s.', time.perf_counter()-started)
+                    started = time.perf_counter()
+                    dataset.save_episode()
+                    logger.info("Episode saved in %.2f s (statistics, video verification, metadata).",
+                                time.perf_counter()-started)
+                    succeeded = True
             except Exception:
                 logger.exception("Failed to save episode")
+                if failure_event is not None:
+                    failure_event.set()
+                try:
+                    _discard_recording_episode(dataset)
+                except Exception:
+                    logger.exception('Failed to discard the unsuccessful episode')
             finally:
+                episode_failed = False
                 episode_finalized_q.put(succeeded)
             continue
         if item is _DISCARD_EPISODE:
             succeeded = False
             try:
-                dataset.clear_episode_buffer()
+                _discard_recording_episode(dataset)
                 logger.warning("Episode discarded (incomplete / sensor failure).")
                 succeeded = True
             except Exception:
                 logger.exception("Failed to discard episode buffer")
             finally:
+                episode_failed = False
                 episode_finalized_q.put(succeeded)
             continue
+        if episode_failed:
+            continue
         try:
+            _check_image_writer_backlog(dataset)
+            started = time.perf_counter()
             dataset.add_frame(item)
+            elapsed = time.perf_counter() - started
+            if rec_q.qsize() >= 32 and elapsed > .03 and time.perf_counter() - last_backlog_warning >= 1:
+                last_backlog_warning = time.perf_counter()
+                logger.warning('Recording backlog: %d/64 frames; last add_frame %.1f ms; storage=%s',
+                               rec_q.qsize(), elapsed * 1000, type(dataset).__name__)
         except Exception:
             logger.exception("Failed to add frame")
+            episode_failed = True
+            if failure_event is not None:
+                failure_event.set()
 
 
 def _main_record(argv: list[str]) -> None:
@@ -306,6 +477,17 @@ def _main_record(argv: list[str]) -> None:
     )
     parser.add_argument("--repo-id", required=True, help="LeRobotDataset repo id")
     parser.add_argument("--task", required=True, help="Task description for every episode")
+    parser.add_argument('--fold-three-fingers', action='store_true',
+                        help='Hold middle/ring/pinky folded; keep thumb/index/wrist teleoperated.')
+    parser.add_argument('--hand-feedback-debug', action=argparse.BooleanOptionalAction, default=True,
+                        help='am200_hw: log commanded and motor-derived hand angles once per second.')
+    parser.add_argument('--video-storage', choices=('deferred', 'streaming', 'images'), default='deferred',
+                        help='Save lightweight captures for later LeRobot conversion (default), '
+                             'or encode H.264 live / use PNG images.')
+    parser.add_argument('--control-dir', type=Path, default=None,
+                        help='Local desktop collector control/preview directory (no TTY needed).')
+    parser.add_argument('--auto-home', action=argparse.BooleanOptionalAction, default=True,
+                        help='Return home between attempts; desktop UI disables this for manual resets.')
     parser.add_argument(
         "--num-episodes",
         type=int,
@@ -344,7 +526,7 @@ def _main_record(argv: list[str]) -> None:
         action="append",
         default=[],
         help=(
-            "Camera spec NAME[:INDEX][:WIDTHxHEIGHT][@FPS], repeatable "
+            "Camera spec NAME[:INDEX|usb=USB_PATH][:WIDTHxHEIGHT][@FPS], repeatable "
             "(e.g. front:0, iphone:1 — defaults to 640x480@30 when omitted). "
             "Cameras become part of the sink's observation; with --backend sim "
             "they're recorded alongside the sim's MuJoCo render. "
@@ -382,40 +564,92 @@ def _main_record(argv: list[str]) -> None:
     parser.add_argument("--urdf-path", default=None, help="Hand URDF file")
     parser.add_argument(
         "--backend",
-        choices=["hardware", "sim", "am200_sim"],
+        choices=["hardware", "sim", "am200_sim", "am200_hw"],
         default="hardware",
-        help="Backend to record against (default: hardware). am200_sim is 20-DoF.",
+        help=(
+            "Backend to record against (default: hardware). am200_sim and am200_hw "
+            "(physical AM-ARM200 + ORCA hand) are 20-DoF."
+        ),
     )
     parser.add_argument(
         "--am200-model",
         default=None,
-        help="Combined AM+hand MJCF for --backend am200_sim (default: orca_am200 model).",
+        help="Combined AM+hand MJCF for the am200 backends (default: orca_am200 model).",
     )
     parser.add_argument(
         "--hand-config",
         default=os.environ.get("ORCA_MODEL_PATH"),
-        help="orca_core hand config.yaml for am200_sim retargeting (default: $ORCA_MODEL_PATH).",
+        help="orca_core hand config.yaml for am200 retargeting (default: $ORCA_MODEL_PATH).",
+    )
+    parser.add_argument(
+        "--arm-config",
+        default=None,
+        help="am200_hw: AM-ARM200 config.yaml (default: configs/am-arm200-3dof).",
+    )
+    parser.add_argument(
+        "--arm-max-step",
+        type=float,
+        default=None,
+        help=(
+            "am200_hw: clip every arm joint to +/- this many rad from the connect-time "
+            "pose (overrides max_step_from_home_rad in the arm config)."
+        ),
     )
     parser.add_argument(
         "--arm-scale",
         type=float,
         default=0.5,
-        help="Flange metres per wrist metre for am200_sim (default: 0.5).",
+        help="Flange metres per wrist metre for the am200 backends (default: 0.5).",
     )
+    parser.add_argument(
+        "--operator-cal",
+        default=None,
+        help="am200 backends: operator calibration file for reproducible episode starts.",
+    )
+    parser.add_argument('--arm-max-velocity-deg-s', type=float, default=None,
+                        help='Limit each arm command to this many degrees/s; pair with acceleration limit.')
+    parser.add_argument('--arm-max-acceleration-deg-s2', type=float, default=None,
+                        help='Limit arm command acceleration in degrees/s^2; pair with velocity limit.')
     parser.add_argument(
         "--no-arm",
         action="store_true",
-        help="am200_sim: hold the arm still; record hand motion only in the 20-D vector.",
+        help="am200 backends: hold the arm still; record hand motion only in the 20-D vector.",
     )
     parser.add_argument(
         "--clutch",
         action="store_true",
-        help="Quest: off-hand pinch clutch for the arm (metaquest + am200_sim).",
+        help="Quest: off-hand pinch clutch for the arm (metaquest + am200 backends).",
+    )
+    parser.add_argument(
+        "--sim-task",
+        default=None,
+        choices=["pinch", "hwatu", "hwatu_mat", "hwatu_place"],
+        help="am200_sim: load a task scene (object respawned + dynamics resampled per episode).",
+    )
+    parser.add_argument(
+        "--randomize",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="am200_sim: per-episode domain randomization "
+        "(default: robot_model/sim_dynamics.yaml).",
+    )
+    parser.add_argument(
+        "--sim-camera",
+        action="append",
+        default=[],
+        metavar="KEY:MJCF_CAMERA",
+        help="am200_sim: record another fixed MJCF camera under KEY, repeatable "
+        "(e.g. wrist:wrist_cam).",
+    )
+    parser.add_argument(
+        "--retargeter", default="adaptive_analytical",
+        choices=["rmsprop", "adaptive_analytical", "key_objectives", "dexpilot"],
+        help="Retarget backend; key_objectives requires its own --retarget-config",
     )
     parser.add_argument(
         "--retarget-config",
         default=os.environ.get("ORCA_RETARGET_CONFIG"),
-        help="Adaptive retargeter YAML (default: $ORCA_RETARGET_CONFIG).",
+        help="Selected backend's YAML (default: $ORCA_RETARGET_CONFIG).",
     )
     parser.add_argument(
         "--port",
@@ -500,7 +734,7 @@ def _main_record(argv: list[str]) -> None:
             "--source manus has no effect without --local; run the Manus publisher "
             "yourself (python -m orca_teleop.ingress.manus.publisher) or add --local."
         )
-    if args.episode_end in ("space", "both") and not sys.stdin.isatty():
+    if args.episode_end in ("space", "both") and not args.control_dir and not sys.stdin.isatty():
         parser.error("--episode-end space/both needs an interactive terminal.")
 
     logging.basicConfig(
@@ -513,47 +747,80 @@ def _main_record(argv: list[str]) -> None:
     # TODO: Use constants key names from lerobot for frame key names
 
     queues = TeleopQueues(
-        landmarks_q=queue.Queue(maxsize=QUEUES_MAXSIZE),
-        actions_q=queue.Queue(maxsize=QUEUES_MAXSIZE),
+        landmarks_q=LatestQueue(_SHUTDOWN),
+        actions_q=LatestQueue(_SHUTDOWN),
     )
     stop_event = threading.Event()
+    advance_event = threading.Event()
+    control = None
+    if args.control_dir:
+        from orca_teleop.collection_control import CollectionControl
+        control = CollectionControl(args.control_dir, stop_event, advance_event)
 
     # Sinks own and compose the full observation
     camera_configs = _parse_camera_configs(args.camera)
     action_composer = None
     retarget_model_path = args.model_path
 
-    if args.backend == "am200_sim":
+    if args.backend in ("am200_sim", "am200_hw"):
         import mujoco
 
         from orca_teleop.am200 import (
             Am200ActionComposer,
+            Am200HardwareSink,
             Am200SimSink,
             ArmMappingConfig,
             CanonicalJointMap,
             HoldArmActionComposer,
+            OperatorCalibration,
+            parse_sim_camera_spec,
         )
 
         if not args.hand_config:
-            parser.error("--backend am200_sim needs --hand-config or $ORCA_MODEL_PATH")
-        sink = Am200SimSink(
-            model_path=args.am200_model,
-            hand_config_path=args.hand_config,
-            render_mode=SIM_RENDER_MODE,
-            camera_configs=camera_configs,
-        )
+            parser.error(f"--backend {args.backend} needs --hand-config or $ORCA_MODEL_PATH")
+        if args.backend == "am200_sim":
+            sink = Am200SimSink(
+                model_path=args.am200_model,
+                hand_config_path=args.hand_config,
+                render_mode=SIM_RENDER_MODE,
+                camera_configs=camera_configs,
+                task=args.sim_task,
+                randomize=args.randomize,
+                extra_cameras=dict(parse_sim_camera_spec(s) for s in args.sim_camera),
+            )
+        else:
+            if args.stub:
+                parser.error("--backend am200_hw cannot be combined with --stub.")
+            sink = Am200HardwareSink(
+                hand_config_path=args.hand_config,
+                arm_config_path=args.arm_config,
+                model_path=args.am200_model,
+                camera_configs=camera_configs,
+                enable_arm=not args.no_arm,
+                arm_max_step_rad=args.arm_max_step,
+                hand_feedback_debug=args.hand_feedback_debug,
+            )
         retarget_model_path = args.hand_config
         if not args.stub:
             if args.no_arm:
                 model = mujoco.MjModel.from_xml_path(str(sink.model_path))
                 joint_map = CanonicalJointMap.load(
-                    sink.model_path.parent / "joint_map.json", model
+                    sink.model_path.parent / "joint_map.json", model,
+                    hand_config_path=args.hand_config if args.backend == 'am200_hw' else None,
                 )
                 action_composer = HoldArmActionComposer(joint_map)
             else:
                 action_composer = Am200ActionComposer.from_model_path(
                     sink.model_path,
-                    config=ArmMappingConfig(scale=args.arm_scale),
+                    hand_config_path=args.hand_config if args.backend == 'am200_hw' else None,
+                    config=ArmMappingConfig(
+                        scale=args.arm_scale,
+                        max_velocity_rad_s=(None if args.arm_max_velocity_deg_s is None
+                                            else np.deg2rad(args.arm_max_velocity_deg_s)),
+                        max_acceleration_rad_s2=(None if args.arm_max_acceleration_deg_s2 is None
+                                                 else np.deg2rad(args.arm_max_acceleration_deg_s2)),
+                    ),
+                    calibration=OperatorCalibration.load(args.operator_cal),
                 )
     elif args.backend == "sim":
         from orca_teleop.sim import OrcaHandSimSink
@@ -573,7 +840,22 @@ def _main_record(argv: list[str]) -> None:
                 f"--hand {args.hand!r} does not match the loaded physical OrcaHand "
                 f"model ({sink.handedness!r}). Pass the matching --model-path or --hand."
             )
-    sink.connect()
+    if args.fold_three_fingers:
+        if args.stub:
+            parser.error('--fold-three-fingers needs a live hand retargeting stream, not --stub')
+        from orca_teleop.hand_modes import FoldThreeFingersComposer
+        action_composer = FoldThreeFingersComposer(retarget_model_path, action_composer)
+        logger.info('Hand mode: middle/ring/pinky held folded; physical targets_deg=%s',
+                    action_composer.pose_deg)
+
+    try:
+        sink.connect()
+        _configure_arm_limits(sink, action_composer)
+    except Exception as exc:
+        if control:
+            control.update(phase='error', error=f'텔레옵 서버 시작 전 로봇·카메라 연결 실패: {exc}')
+            control.close()
+        raise
     assert isinstance(sink, RecordableSink), "Sinks must be recordable to collect data"
 
     joint_ids = list(sink.joint_ids)
@@ -596,17 +878,63 @@ def _main_record(argv: list[str]) -> None:
         logger.info("--overwrite: removing existing dataset at %s", target_root)
         shutil.rmtree(target_root)
 
-    dataset = LeRobotDataset.create(
+    dataset = _create_recording_dataset(
+        LeRobotDataset,
         repo_id=args.repo_id,
         fps=args.fps,
         features=features,
         root=args.root,
-        use_videos=True,
+        video_storage=args.video_storage,
     )
     logger.info("Dataset root: %s", dataset.root)
+    if control:
+        import hashlib
+        from datetime import datetime, timezone
+        from orca_teleop.collection_control import atomic_json
+
+        configuration = {}
+        paths = {
+            'hand_config': args.hand_config,
+            'retarget_config': args.retarget_config,
+            'urdf': args.urdf_path,
+            'arm_config': str(sink._arm_config_path) if hasattr(sink, '_arm_config_path') else None,
+        }
+        if args.hand_config:
+            paths['calibration'] = str(Path(args.hand_config).with_name('calibration.yaml'))
+        arm = getattr(sink, '_arm', None)
+        if arm is not None and arm._home_pose_path is not None:
+            paths['arm_home'] = str(arm._home_pose_path)
+        for key, value in paths.items():
+            if value and Path(value).is_file():
+                content = Path(value).read_bytes()
+                configuration[key] = {'sha256': hashlib.sha256(content).hexdigest(), 'path': value}
+                shutil.copyfile(value, dataset.root / f'collection_{key}{Path(value).suffix}')
+        arm_reference = None if arm is None else {
+            'motor_home_rad': arm._motor_home.tolist(),
+            'joint_signs': arm._signs.tolist(),
+            'motor_ids': arm.motor_ids,
+            'model_joint_limits_rad': (None if arm.model_limits is None
+                                       else [bound.tolist() for bound in arm.model_limits]),
+        }
+        atomic_json(dataset.root / 'collection_session.json', {
+            'created_at': datetime.now(timezone.utc).isoformat(),
+            'arguments': {key: str(value) if isinstance(value, Path) else value
+                          for key, value in vars(args).items()},
+            'joint_ids': joint_ids, 'angle_units': 'canonical_model_radians',
+            'arm_reference': arm_reference, 'configuration': configuration,
+            'fixed_finger_pose_deg': (action_composer.pose_deg if args.fold_three_fingers else None),
+        })
+        control.update(dataset_root=str(dataset.root), joint_ids=joint_ids, target=args.num_episodes,
+                       retargeter_backend=args.retargeter, retarget_config=args.retarget_config)
 
     rec_q: queue.Queue = queue.Queue(maxsize=64)
     episode_finalized_q: queue.Queue[bool] = queue.Queue(maxsize=1)
+    action_mirror = TeleopActionMirror()
+    dispatch_enabled = threading.Event()
+    arm_returner = None
+    if control and args.backend == 'am200_hw' and not args.no_arm:
+        from orca_teleop.am200.episode_return import ArmEpisodeReturn
+        arm_returner = ArmEpisodeReturn(sink, action_composer, dispatch_enabled)
 
     ingress_server: IngressServer | None = None
     retargeter_thread: threading.Thread | None = None
@@ -678,21 +1006,25 @@ def _main_record(argv: list[str]) -> None:
             kwargs={
                 "landmark_source": ("webxr" if args.source == "metaquest" else "mediapipe"),
                 "retargeter_config_path": args.retarget_config,
-                "action_composer": action_composer,
+                "retargeter_backend": args.retargeter,
+                "action_composer": arm_returner if arm_returner else action_composer,
+                "fixed_hand_pose_deg": action_composer.pose_deg if args.fold_three_fingers else None,
+                "diagnostic_hand_map": (sink._map if args.backend == 'am200_hw'
+                                        and args.hand_feedback_debug else None),
             },
             name="retargeter",
         )
         retargeter_thread.start()
 
+    recorder_failed = threading.Event()
     recorder_thread = threading.Thread(
         target=_recorder_loop,
         args=(dataset, rec_q, episode_finalized_q),
+        kwargs={'failure_event': recorder_failed},
         name="dataset-recorder",
     )
     recorder_thread.start()
 
-    action_mirror = TeleopActionMirror()
-    dispatch_enabled = threading.Event()
     teleop_thread = threading.Thread(
         target=teleop_consumer_loop,
         args=(queues.actions_q,),
@@ -700,7 +1032,8 @@ def _main_record(argv: list[str]) -> None:
             "mirror": action_mirror,
             "stop_event": stop_event,
             "shutdown_sentinel": _SHUTDOWN,
-            "dispatch_action": None if args.stub else sink.dispatch_action,
+            "dispatch_action": (None if args.stub else
+                                arm_returner.dispatch if arm_returner else sink.dispatch_action),
             "dispatch_enabled": dispatch_enabled,
         },
         name="teleop-consumer",
@@ -710,13 +1043,16 @@ def _main_record(argv: list[str]) -> None:
 
     use_keyboard = args.episode_end in ("space", "both")
     use_timer = args.episode_end in ("timer", "both")
-    advance_event = threading.Event()
     keyboard: _KeyboardController | None = None
-    if use_keyboard:
+    if use_keyboard and control is None:
         keyboard = _KeyboardController(stop_event, advance_event)
         keyboard.start()
 
-    if use_keyboard:
+    if control:
+        logger.info('Desktop collector: Record starts an episode; Save keeps it; '
+                    'Discard/Stop drops the unfinished attempt. arm_button_returns=%s; auto_home=%s',
+                    arm_returner is not None, args.auto_home)
+    elif use_keyboard:
         logger.info(
             "Recording up to %d episode(s). From episode 2 onward: go_home()"
             "%s before recording. Press SPACE to save and advance, 'q'/Esc to finish.",
@@ -732,24 +1068,32 @@ def _main_record(argv: list[str]) -> None:
         )
 
     try:
-        for ep_idx in range(args.num_episodes):
+        ep_idx = 0
+        attempt_idx = 0
+        while ep_idx < args.num_episodes:
             if stop_event.is_set():
                 break
+            attempt_idx += 1
             logger.info("=== Episode %d / %d ===", ep_idx + 1, args.num_episodes)
             advance_event.clear()
+            if control:
+                control.start_event.clear()
+                control.discard_event.clear()
+                control.update(phase='warming_up', saved=ep_idx, attempt=attempt_idx,
+                               frames=0, seconds=0)
             if quest_reset_event is not None:
                 quest_reset_event.set()
             if action_composer is not None:
-                action_composer.reset()
+                (arm_returner or action_composer).reset()
 
-            if ep_idx > 0 and not args.stub:
+            if attempt_idx > 1 and args.auto_home and not args.stub:
                 logger.info("Resetting robot to home position...")
                 try:
                     sink.go_home()
                 except Exception:
                     logger.exception("Failed to move to home position; continuing anyway.")
 
-            if ep_idx > 0 and args.rest_seconds > 0 and not stop_event.is_set():
+            if attempt_idx > 1 and args.rest_seconds > 0 and not stop_event.is_set():
                 logger.info("Resting %.1fs before recording...", args.rest_seconds)
                 stop_event.wait(args.rest_seconds)
 
@@ -770,7 +1114,7 @@ def _main_record(argv: list[str]) -> None:
                 break
 
             ready = wait_for_teleop_mirror_ready(
-                get_observation=sink.get_observation,
+                get_observation=(lambda: _preview_observation(sink, control)),
                 mirror=action_mirror,
                 stop_event=stop_event,
             )
@@ -781,20 +1125,45 @@ def _main_record(argv: list[str]) -> None:
                 )
                 break
 
+            if control:
+                # Teleop can be positioned between trials without collecting
+                # reset motion. Only the Record button starts a new episode.
+                dispatch_enabled.set()
+                control.update(phase='ready')
+                while not stop_event.is_set() and not control.start_event.wait(0.1):
+                    _preview_observation(sink, control)
+                    if control.save_arm_home_event.is_set():
+                        control.save_arm_home_event.clear()
+                        pose = sink.save_arm_home()
+                        from orca_teleop.collection_control import atomic_json
+                        atomic_json(dataset.root / 'collection_arm_home.json', pose)
+                        if not stop_event.is_set():
+                            control.update(phase='ready', arm_home_saved=True)
+                if stop_event.is_set():
+                    break
+                if arm_returner and not _return_arm_for_collection(
+                        arm_returner, control, action_mirror, queues, stop_event, 'record'):
+                    break
+                control.update(phase='recording')
+
             logger.info("Sensors ready — recording episode %d at %d Hz.", ep_idx + 1, args.fps)
             dispatch_enabled.set()
             ep_end = time.perf_counter() + args.episode_seconds
             n_frames = 0
             episode_ok = True
+            episode_start = time.perf_counter()
+            last_ui_update = 0.0
             ticker = RateTicker(dt=1.0 / float(args.fps))
 
             while not stop_event.is_set():
+                if recorder_failed.is_set():
+                    raise RuntimeError('데이터 프레임 저장 실패. 현재 시도를 폐기합니다.')
                 if use_keyboard and advance_event.is_set():
                     break
                 if use_timer and time.perf_counter() >= ep_end:
                     break
 
-                action = action_mirror.snapshot()
+                action = action_mirror.applied_snapshot()
                 if action is None:
                     ticker.tick()
                     continue
@@ -803,11 +1172,15 @@ def _main_record(argv: list[str]) -> None:
 
                 try:
                     observation = sink.get_observation()
+                    if control:
+                        control.observe(observation)
                 except Exception:
                     logger.exception(
                         "Observation capture failed; discarding episode and aborting session."
                     )
                     episode_ok = False
+                    if control:
+                        control.update(phase='error', error='센서 수신이 중단되어 현재 시도를 폐기했습니다.')
                     stop_event.set()
                     break
 
@@ -823,17 +1196,33 @@ def _main_record(argv: list[str]) -> None:
                     rec_q.put_nowait(frame)
                     n_frames += 1
                 except queue.Full:
-                    logger.debug("rec_q full; dropping frame")
+                    raise RuntimeError('녹화 저장 대기열이 가득 찼습니다 (CPU·저장 처리 지연). '
+                                       '현재 시도를 폐기합니다. 자세한 처리 시간은 로그를 확인하세요.')
 
                 ticker.tick()
+                if control and time.perf_counter() - last_ui_update >= 0.25:
+                    control.update(frames=n_frames, seconds=round(time.perf_counter() - episode_start, 1))
+                    last_ui_update = time.perf_counter()
 
             dispatch_enabled.clear()
+            if control:
+                episode_ok = episode_ok and not control.discard_event.is_set()
+                if episode_ok or not stop_event.is_set():
+                    control.update(phase='finalizing')
             logger.info("Episode %d captured %d frames.", ep_idx + 1, n_frames)
             if episode_ok and n_frames > 0:
                 logger.info("Finalizing episode %d before continuing...", ep_idx + 1)
                 rec_q.put(_SAVE_EPISODE)
                 if not episode_finalized_q.get():
                     logger.error("Stopping because episode %d could not be saved.", ep_idx + 1)
+                    if control:
+                        control.update(phase='error', error='에피소드 저장 실패. 로그와 저장 공간을 확인해 주세요.')
+                    break
+                ep_idx += 1
+                if control:
+                    control.update(saved=ep_idx)
+                if arm_returner and not _return_arm_for_collection(
+                        arm_returner, control, action_mirror, queues, stop_event, 'save'):
                     break
             elif n_frames > 0:
                 logger.info("Discarding episode %d before continuing...", ep_idx + 1)
@@ -844,8 +1233,26 @@ def _main_record(argv: list[str]) -> None:
             elif not episode_ok:
                 logger.error("Episode %d produced no usable frames; not saving.", ep_idx + 1)
 
+            # A UI/pedal retry returns only after the failed buffer is gone,
+            # including a retry pressed before its first usable frame. Stop
+            # keeps the shutdown path responsible for the final return.
+            if (control and control.discard_event.is_set() and arm_returner
+                    and not _return_arm_for_collection(
+                        arm_returner, control, action_mirror, queues, stop_event, 'discard')):
+                break
+
     except KeyboardInterrupt:
         logger.info("Interrupted — finalizing dataset.")
+        if control:
+            rec_q.put(_DISCARD_EPISODE)
+            episode_finalized_q.get()
+
+    except Exception as exc:
+        if control:
+            control.update(phase='error', error=str(exc))
+            rec_q.put(_DISCARD_EPISODE)
+            episode_finalized_q.get()
+        raise
 
     finally:
         stop_event.set()
@@ -866,6 +1273,16 @@ def _main_record(argv: list[str]) -> None:
         teleop_thread.join(timeout=JOIN_TIMEOUT)
 
         recorder_thread.join()
+        try:
+            dataset.stop_image_writer()
+        except Exception:
+            logger.exception('Failed to stop the image writer')
+        try:
+            dataset.finalize()  # writes the parquet footers; unloadable without it
+        except Exception:
+            logger.exception("Failed to finalize the dataset")
+            if control:
+                control.update(phase='error', error='데이터셋 마무리 실패. 로그와 저장 공간을 확인해 주세요.')
 
         try:
             num_eps = dataset.num_episodes
@@ -873,7 +1290,10 @@ def _main_record(argv: list[str]) -> None:
             num_eps = "?"
         logger.info("Dataset now contains %s episode(s) at %s", num_eps, dataset.root)
 
-        if args.push_to_hub:
+        if args.push_to_hub and args.video_storage == 'deferred':
+            logger.warning('Deferred captures must be converted to LeRobot before uploading. '
+                           'Run scripts/convert_recordings.py --source %s', dataset.root)
+        elif args.push_to_hub:
             try:
                 logger.info("Pushing %s to the Hugging Face Hub...", args.repo_id)
                 dataset.push_to_hub()
@@ -881,7 +1301,19 @@ def _main_record(argv: list[str]) -> None:
             except Exception:
                 logger.exception("Failed to push to hub")
 
-        sink.close()
+        if control and args.backend == 'am200_hw' and not args.no_arm:
+            control.update(phase='parking' if control._state['phase'] != 'error' else 'error')
+        try:
+            sink.close()
+        except Exception as exc:
+            logger.exception('Hardware shutdown failed')
+            if control:
+                control.update(phase='error', error=str(exc))
+            else:
+                raise
+        finally:
+            if control:
+                control.finish(saved=dataset.num_episodes)
 
 
 def main() -> None:

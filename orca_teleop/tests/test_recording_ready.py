@@ -7,6 +7,7 @@ import threading
 import time
 
 import numpy as np
+import pytest
 from orca_core import OrcaJointPositions
 
 from orca_teleop.recording import (
@@ -20,6 +21,13 @@ from orca_teleop.recording import (
 
 _SHUTDOWN = object()
 _JOINT_IDS = [f"j{i}" for i in range(3)]
+
+
+@pytest.fixture(autouse=True)
+def independent_joint_schema(monkeypatch):
+    # Other suites load physical hands and set a process-wide joint schema.
+    # These readiness tests deliberately use three synthetic j0/j1/j2 joints.
+    monkeypatch.setattr(OrcaJointPositions, '_default_joint_ids', None)
 
 
 def _action(values: list[float] | None = None) -> OrcaJointPositions:
@@ -257,3 +265,31 @@ def test_action_to_feature_accepts_robot_joint_command():
     out = action_to_feature(cmd, list(roles))
     assert out.dtype == np.float32
     np.testing.assert_allclose(out, [0.1, -0.2, 0.3])
+
+
+def test_mirror_readiness_does_not_accept_stopped_stream_after_slow_observation(monkeypatch):
+    import orca_teleop.recording as recording
+
+    clock = [0.0]
+    stop = threading.Event()
+    mirror = TeleopActionMirror()
+    emitted = [False]
+
+    def sleep(seconds):
+        clock[0] += seconds
+        if not emitted[0]:
+            for _ in range(5):
+                mirror.update(_action())
+            emitted[0] = True
+        elif clock[0] > 3:
+            stop.set()
+
+    def observation():
+        clock[0] += 1.1  # Stream stops while the sensor call is blocked.
+
+    monkeypatch.setattr(recording.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(recording.time, 'sleep', sleep)
+    assert not wait_for_teleop_mirror_ready(
+        get_observation=observation, mirror=mirror, stop_event=stop,
+        min_action_streak=5, min_obs_streak=1,
+    )

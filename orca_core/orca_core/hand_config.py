@@ -7,6 +7,7 @@
 # ==============================================================================
 
 import dataclasses
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal
@@ -212,6 +213,9 @@ class OrcaHandConfig(BaseHandConfig):
     calibration_step_period: float = 0.01  # s
     calibration_threshold: float = 0.01  # rad
     calibration_num_stable: int = 20
+    # Optional per-joint lower bounds on MOTOR travel, in radians. These are
+    # acceptance checks from measured hardware, not commands to force travel.
+    calibration_min_motor_span_rad: Dict[str, float] = field(default_factory=dict)
     calibration_sequence: List[dict] = field(default_factory=list)
     use_joint_feedback: bool | None = None
     joint_encoder_joints: List[str] | None = None
@@ -313,6 +317,16 @@ class OrcaHandConfig(BaseHandConfig):
             kwargs["calibration_threshold"] = float(config["calibration_threshold"])
         if "calibration_num_stable" in config:
             kwargs["calibration_num_stable"] = int(config["calibration_num_stable"])
+        if "calibration_min_motor_span_rad" in config:
+            raw_spans = config["calibration_min_motor_span_rad"]
+            if not isinstance(raw_spans, dict):
+                raise HandConfigValidationError("calibration_min_motor_span_rad must be a joint mapping.")
+            try:
+                kwargs["calibration_min_motor_span_rad"] = {
+                    str(joint): float(span) for joint, span in raw_spans.items()
+                }
+            except (TypeError, ValueError) as exc:
+                raise HandConfigValidationError("calibration_min_motor_span_rad values must be positive finite radians.") from exc
         if "calibration_sequence" in config:
             kwargs["calibration_sequence"] = list(config["calibration_sequence"])
         if "use_joint_feedback" in config:
@@ -364,6 +378,12 @@ class OrcaHandConfig(BaseHandConfig):
             if motor_id not in self.motor_ids:
                 raise HandConfigValidationError(
                     f"Motor ID {motor_id} is not in the motor IDs list."
+                )
+
+        for joint, span in self.calibration_min_motor_span_rad.items():
+            if joint not in self.joint_ids or not math.isfinite(span) or span <= 0:
+                raise HandConfigValidationError(
+                    "calibration_min_motor_span_rad requires configured joints and positive finite radians."
                 )
 
         for step in self.calibration_sequence:

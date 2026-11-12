@@ -144,6 +144,30 @@ def test_targets_are_clamped_to_the_joint_limits(sink):
     assert np.all(sink._target >= sink._map.lower - 1e-9)
 
 
+def test_optional_arm_envelope_matches_hardware_client(sink, monkeypatch):
+    from orca_teleop.am200.arm_client import AmArmFeetech, default_arm_config_path
+
+    motor_writes = []
+
+    class Client:
+        def write_positions_sync(self, ids, motor, **kwargs):
+            motor_writes.append(motor.copy())
+
+    # Config and command conversion only; no serial port is opened.
+    arm = AmArmFeetech(default_arm_config_path(), max_step_rad=0.3)
+    arm._client = Client()
+    arm._motor_home = np.zeros(3)
+    monkeypatch.setattr(sink, "_arm_max_step_rad", 0.3)
+    for q in ([0.8, -0.7, 0.1], [-0.8, 0.6, -0.2]):
+        arm.write_model_rad(np.array(q))
+        target = sink._home_vector()
+        hand = target[3:].copy()
+        target[:3] = q
+        sink.set_target(RobotJointCommand.now(tuple(sink.joint_ids), target))
+        np.testing.assert_allclose(sink._target[:3], motor_writes[-1] / arm._signs, atol=1e-7)
+        np.testing.assert_array_equal(sink._target[3:], hand)
+
+
 def test_a_mismatched_command_is_rejected_rather_than_misapplied(sink):
     with pytest.raises(ValueError):
         sink.set_target(RobotJointCommand.now(("arm.shoulder_pan",), np.zeros(1)))

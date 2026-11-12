@@ -114,7 +114,8 @@ def run_calibration(
             ``encoder_anchor_recorded``, ``encoder_anchor_failed``,
             ``offset_calibration_failed``, ``torque_release_failed``,
             ``wrist_skipped``, ``step_done``, ``calibration_done``,
-            ``calibration_aborted``,
+            ``calibration_aborted``, ``calibration_span_invalid``,
+            ``calibration_isolation_failed``,
             ``cleanup_failed``). Called from the calibrating thread; must be
             fast and non-blocking. Exceptions raised by the callback are
             swallowed.
@@ -150,10 +151,23 @@ def _release_after_abort(
     doesn't strain against a hardstop after an abnormal exit."""
     try:
         hand.set_max_current(hand.config.max_current)
-        hand.disable_torque()
+        failed = hand.disable_torque()
+        if failed:
+            raise RuntimeError(f"Torque release not acknowledged by motor IDs: {failed}")
     except Exception as e:
         _emit(progress_callback, "cleanup_failed", error=str(e))
         logger.warning("cleanup after aborted calibration failed: %s", e)
+
+
+def _release_before_drive(hand: "OrcaHand", progress_callback: Optional[ProgressCallback]) -> None:
+    """Do not drive a joint while another servo may retain a powered goal."""
+    failed = hand.disable_torque()
+    if failed:
+        _emit(progress_callback, "calibration_isolation_failed", motor_ids=list(failed))
+        raise RuntimeError(
+            f"Calibration stopped: torque OFF was not acknowledged by motor IDs {failed}. "
+            "Other joints may still be powered; no new calibration motion was started."
+        )
 
 
 def _build_calibration_result(
@@ -335,6 +349,19 @@ def _drive_calibration(
             if direction == FLEX
         }
 
+    calibration_motor_ids = sorted({
+        hand.config.joint_to_motor_map[joint]
+        for step in calibration_sequence
+        for joint in step[JOINTS]
+    })
+    validate_frame = getattr(hand.motor_client, "validate_position_frame", None)
+    if calibration_motor_ids and validate_frame is not None:
+        positions = _read_motor_pos_checked(hand)
+        validate_frame(calibration_motor_ids, [
+            positions[hand.config.motor_id_to_idx_dict[mid]]
+            for mid in calibration_motor_ids
+        ])
+
     hand._compute_wrap_offsets_dict()
 
     for step in calibration_sequence:
@@ -347,7 +374,12 @@ def _drive_calibration(
 
     calibrated_joints: dict = {}
 
-    hand.set_control_mode(CURRENT_BASED_POSITION)
+    # Feetech mode changes re-enable torque. Restrict them to this run's
+    # motors so a partial calibration cannot engage unrelated joints with
+    # old position targets left in their registers.
+    _release_before_drive(hand, progress_callback)
+    hand.set_control_mode(CURRENT_BASED_POSITION, motor_ids=calibration_motor_ids)
+    _release_before_drive(hand, progress_callback)
     hand.set_max_current(hand.config.calibration_current)
 
     _emit(
@@ -358,7 +390,7 @@ def _drive_calibration(
     )
 
     for step_index, step in enumerate(calibration_sequence):
-        hand.disable_torque()
+        _release_before_drive(hand, progress_callback)
 
         if should_stop():
             _emit(progress_callback, "calibration_aborted")
@@ -583,8 +615,27 @@ def _drive_calibration(
             ):
                 continue
 
-            motor_limits[motor_id] = list(pending_limits[motor_id])
-            delta_motor = motor_limits[motor_id][1] - motor_limits[motor_id][0]
+            candidate = list(pending_limits[motor_id])
+            delta_motor = candidate[1] - candidate[0]
+            # The endpoints must be separated beyond the hardstop detector's
+            # own positional tolerance. Keep the prior pair on a failed sweep.
+            min_span = max(
+                2 * float(hand.config.calibration_threshold), 1e-6,
+                hand.config.calibration_min_motor_span_rad.get(joint, 0.0),
+            )
+            if not np.isfinite(delta_motor) or delta_motor <= min_span:
+                _emit(
+                    progress_callback, "calibration_span_invalid",
+                    motor=motor_id, joint=joint, span=delta_motor,
+                    minimum_span=min_span, limits=candidate,
+                )
+                raise ValueError(
+                    f"Calibration failed for {joint} (motor {motor_id}): "
+                    f"motor span {delta_motor:.6f} rad must exceed {min_span:.6f} rad. "
+                    "The candidate did not replace the prior calibration. "
+                    "Check motor motion, tendon blockage, and the encoder position frame."
+                )
+            motor_limits[motor_id] = candidate
             delta_joint = (
                 hand.config.joint_roms_dict[joint][1]
                 - hand.config.joint_roms_dict[joint][0]

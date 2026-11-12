@@ -20,6 +20,24 @@
 # Logs and local runtime
 *.log
 /tmp/
+.env
+.env.*
+.aws/
+.codex/
+.agents/
+
+# Local demonstrations, checkpoints, session state and exports
+/data/*
+!/data/contact_calibration/
+/data/contact_calibration/*
+!/data/contact_calibration/full_hand_contacts.json
+!/data/contact_calibration/full_hand_surface.json
+!/data/contact_calibration/full_hand_taught.json
+!/data/contact_calibration/powered_contacts.json
+/outputs/
+/media/
+/research/
+configs/**/calibration.backup-*.yaml
 
 # Optional huge generated renders
 orca_am200/renders/

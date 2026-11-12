@@ -30,6 +30,7 @@ Publishers are standalone scripts that know nothing about the robot, they just s
 The retargeter and robot stages run as threads on the robot-side machine.
 """
 
+import inspect
 import logging
 import queue
 import socket
@@ -53,9 +54,9 @@ from orca_teleop.constants import (
     HEARTBEAT_INTERVAL,
     JOIN_TIMEOUT,
     MOTION_NUM_STEPS,
-    QUEUES_MAXSIZE,
 )
 from orca_teleop.ingress.server import HandLandmarks, IngressServer
+from orca_teleop.latest import LatestQueue, put_latest
 from orca_teleop.retargeting.retargeter import Retargeter, RetargeterBackend, TargetPose
 
 logger = logging.getLogger(__name__)
@@ -66,10 +67,7 @@ LandmarkSource = Literal["mediapipe", "metaquest", "webxr"]
 
 def _shutdown_queue(q: "queue.Queue[Any]") -> None:
     """Signal a downstream worker to stop, without blocking."""
-    try:
-        q.put_nowait(_SHUTDOWN)
-    except queue.Full:
-        pass
+    put_latest(q, _SHUTDOWN, _SHUTDOWN)
 
 
 @dataclass
@@ -88,6 +86,24 @@ class SinkObservation:
 
     joint_state: np.ndarray
     images: dict[str, np.ndarray]
+
+
+def _configure_arm_limits(sink, composer) -> None:
+    """Bind IK to servo travel before any producer starts; preserve hold on error."""
+    try:
+        limits = getattr(sink, 'arm_joint_limits', None)
+        configure = getattr(composer, 'set_arm_limits', None)
+        if limits is not None and callable(configure):
+            configure(*limits)
+    except Exception:
+        try:
+            if 'return_home' in inspect.signature(sink.close).parameters:
+                sink.close(return_home=False)
+            else:
+                sink.close()
+        except Exception:
+            logger.exception('Arm limit setup cleanup failed')
+        raise
 
 
 class RobotSink(ABC):
@@ -152,6 +168,18 @@ class RecordableSink(RobotSink):
         """Move the hand to the recording rest pose between episodes."""
 
 
+def connect_orca_hand(hand: Any) -> tuple[bool, str]:
+    """Connect across ORCA Core versions with and without ``interactive``."""
+    parameters = inspect.signature(hand.connect).parameters.values()
+    supports_interactive = any(
+        parameter.name == "interactive" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    if supports_interactive:
+        return hand.connect(interactive=False)
+    return hand.connect()
+
+
 class OrcaHandSink(RecordableSink):
     """Default sink: streams actions to a physical ``OrcaHand``.
 
@@ -172,7 +200,7 @@ class OrcaHandSink(RecordableSink):
 
     def connect(self) -> None:
         if self._connect_hardware:
-            success, message = self._hand.connect(interactive=False)
+            success, message = connect_orca_hand(self._hand)
             if not success:
                 raise RuntimeError(f"Robot failed to connect: {message}")
             self._hand.init_joints()
@@ -267,6 +295,10 @@ def retargeter_worker(
     landmarks_viz: Any | None = None,
     landmark_source: LandmarkSource = "mediapipe",
     action_composer: Callable[[HandLandmarks, OrcaJointPositions], Any] | None = None,
+    fixed_hand_pose_deg: dict[str, float] | None = None,
+    diagnostic_hand_map: Any | None = None,
+    independent_arm: bool = True,
+    hand_result_callback: Callable | None = None,
 ) -> None:
     """Consume ``HandLandmarks`` from the gRPC ingress, retarget, push to actions_q.
 
@@ -283,6 +315,22 @@ def retargeter_worker(
             "'mediapipe', 'metaquest', or 'webxr'."
         )
 
+    joint_map = getattr(action_composer, 'joint_map', None)
+    if independent_arm and joint_map is not None:
+        from orca_teleop.am200.realtime import independent_arm_worker
+        independent_arm_worker(
+            queues, stop_event, composer=action_composer,
+            hand_worker_kwargs=dict(
+                model_path=model_path, urdf_path=urdf_path,
+                retargeter_backend=retargeter_backend,
+                retargeter_config_path=retargeter_config_path,
+                landmarks_viz=landmarks_viz, landmark_source=landmark_source,
+                fixed_hand_pose_deg=fixed_hand_pose_deg,
+                diagnostic_hand_map=diagnostic_hand_map,
+            ),
+        )
+        return
+
     _LOG_EVERY = 30
     _t_retarget_ms: list[float] = []
     _t_window_start: float = time.perf_counter()
@@ -295,9 +343,17 @@ def retargeter_worker(
                 backend=retargeter_backend,
                 config_path=retargeter_config_path,
             )
+            if fixed_hand_pose_deg:
+                configure = getattr(retargeter, 'set_fixed_hand_joints', None)
+                if not callable(configure):
+                    raise ValueError('Selected retargeter cannot solve fixed hand joints')
+                configure(fixed_hand_pose_deg)
         except Exception:
             logger.exception("Retargeter init failed; shutting down worker.")
             return
+
+        logger.info("Hand retargeter ready: backend=%s config=%s", retargeter_backend,
+                    retargeter_config_path or "<backend default>")
 
         while not stop_event.is_set():
             try:
@@ -341,6 +397,7 @@ def retargeter_worker(
                     joint_positions=keypoints,
                     source="mediapipe",
                     wrist_angle_degrees=item.wrist_angle_degrees,
+                    timestamp_ns=item.timestamp_ns,
                 )
                 action = retargeter.retarget(target_pose)
             except (AssertionError, ValueError):
@@ -354,16 +411,41 @@ def retargeter_worker(
 
             # Lets an embodiment with more joints than the hand build its own
             # command from the same frame, without the hand-only path changing.
-            if action_composer is not None:
+            ik_action = action
+            if hand_result_callback is not None:
+                if fixed_hand_pose_deg:
+                    action = OrcaJointPositions({**action.data, **fixed_hand_pose_deg})
+                trace = None
+                if diagnostic_hand_map is not None and callable(getattr(retargeter, 'command_diagnostics', None)):
+                    try:
+                        m = diagnostic_hand_map
+                        hand = np.clip(m.hand_from_physical(action),
+                                       m.lower[m.hand_slice], m.upper[m.hand_slice])
+                        physical = m.hand_to_physical(hand)
+                        trace = retargeter.command_diagnostics(ik_action.data, physical, item.timestamp_ns)
+                    except Exception:
+                        logger.exception('Hand diagnostic failed; retaining the valid command')
+                hand_result_callback(item, action, trace)
+            elif action_composer is not None:
                 try:
                     action = action_composer(item, action)
                 except Exception:
                     logger.exception("Action composer failed; forwarding the hand action.")
 
-            try:
-                queues.actions_q.put_nowait(action)
-            except queue.Full:
-                pass
+            if hand_result_callback is None and diagnostic_hand_map is not None and callable(getattr(retargeter, 'command_diagnostics', None)):
+                from dataclasses import replace
+                from orca_teleop.am200.canonical import RobotJointCommand
+                if isinstance(action, RobotJointCommand):
+                    try:
+                        final = diagnostic_hand_map.clip(action.position)
+                        physical = diagnostic_hand_map.hand_to_physical(final[diagnostic_hand_map.hand_slice])
+                        trace = retargeter.command_diagnostics(ik_action.data, physical, action.timestamp_ns)
+                        action = replace(action, hand_diagnostics=trace)
+                    except Exception:
+                        logger.exception('Final hand diagnostic failed; retaining the valid command')
+
+            if hand_result_callback is None:
+                put_latest(queues.actions_q, action, _SHUTDOWN)
 
             if len(_t_retarget_ms) >= _LOG_EVERY:
                 num_samples = len(_t_retarget_ms)
@@ -461,8 +543,8 @@ def run(
         sink = OrcaHandSink(model_path)
 
     queues = TeleopQueues(
-        landmarks_q=queue.Queue(maxsize=QUEUES_MAXSIZE),
-        actions_q=queue.Queue(maxsize=QUEUES_MAXSIZE),
+        landmarks_q=LatestQueue(_SHUTDOWN),
+        actions_q=LatestQueue(_SHUTDOWN),
     )
     stop_event = threading.Event()
 
@@ -474,6 +556,7 @@ def run(
         landmarks_viz.start()
 
     sink.connect()
+    _configure_arm_limits(sink, action_composer)
     if model_path is None:
         sink_model_path = getattr(sink, "retarget_model_path", None)
         if sink_model_path:
@@ -850,7 +933,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--retargeter",
         default="adaptive_analytical",
-        choices=["rmsprop", "adaptive_analytical"],
+        choices=["rmsprop", "adaptive_analytical", "key_objectives", "dexpilot"],
         help="Retargeter backend (default: adaptive_analytical)",
     )
     parser.add_argument(

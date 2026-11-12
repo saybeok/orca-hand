@@ -36,6 +36,8 @@ from .feetech import (
     SMS_STS_GOAL_SPEED_L,
     SMS_STS_ID,
     SMS_STS_BAUD_RATE,
+    SMS_STS_MIN_ANGLE_LIMIT_L,
+    SMS_STS_MAX_ANGLE_LIMIT_L,
 )
 
 # Map host-facing baud rates to the firmware's register code.
@@ -236,12 +238,14 @@ class FeetechClient(MotorClient):
                     pass
                 raise
 
-    def disconnect(self) -> None:
+    def disconnect(self, *, disable_torque: bool = True) -> None:
         """Disconnects from the Feetech motors.
 
         The port is always closed and the client deregistered, even when the
         final torque-disable raises (e.g. the serial link is already gone);
         that exception propagates after cleanup.
+        ``disable_torque=False`` closes the serial port while leaving the last
+        servo target active, for an explicitly requested loaded-arm hold.
         """
         if not self._connected:
             return
@@ -253,7 +257,8 @@ class FeetechClient(MotorClient):
         with self._bus_lock:
             try:
                 # Disable torque before disconnecting
-                self.set_torque_enabled(self.motor_ids, False, retries=0)
+                if disable_torque:
+                    self.set_torque_enabled(self.motor_ids, False, retries=0)
             finally:
                 self.port_handler.closePort()
                 self._connected = False
@@ -719,6 +724,28 @@ class FeetechClient(MotorClient):
         # position frame instead.
         return False
 
+    def validate_position_frame(self, motor_ids: Sequence[int], positions) -> None:
+        """Check measured positions before a hold or hardstop sweep.
+
+        Incremental commands may intentionally be clamped at native servo
+        endpoints. A measured position outside the writer's frame, however,
+        cannot be held correctly and needs encoder recentering first.
+        """
+        if len(motor_ids) != len(positions):
+            raise ValueError("motor_ids and positions must have the same length")
+        for motor_id, position in zip(motor_ids, positions):
+            if not np.isfinite(position):
+                raise ValueError(f"Motor {motor_id} has a non-finite position")
+            raw = self._rad_to_raw(float(position), self.pos_scale)
+            if not POS_MIN <= raw <= POS_MAX:
+                raise ValueError(
+                    f"Motor {motor_id} reports {float(position):.6f} rad outside "
+                    f"this driver's command frame (raw {raw}, allowed {POS_MIN}..{POS_MAX}). "
+                    "Holding or calibrating here would clamp commands to an endpoint. "
+                    "Release torque, place the joint halfway through its travel, "
+                    "recenter that motor's encoder, then recalibrate."
+                )
+
     def calibrate_offset(self, motor_id: int, upper: bool = True) -> bool:
         """Set current physical position to read as upper or lower bound.
 
@@ -861,6 +888,68 @@ class FeetechClient(MotorClient):
 
             # Clear params for next use
             self.packet_handler.groupSyncWrite.clearParam()
+
+    def read_sts_position_limits(self) -> dict[int, tuple[float, float]]:
+        """Read STS servo-mode angle limits; never change EEPROM or torque."""
+        self._check_connected()
+        with self._bus_lock:
+            reader = GroupSyncRead(self.packet_handler, SMS_STS_MIN_ANGLE_LIMIT_L, 4)
+            for motor_id in self.motor_ids:
+                reader.addParam(motor_id)
+            if reader.txRxPacket() != COMM_SUCCESS:
+                self._flush_input_buffer()
+                raise OSError('STS position-limit read failed')
+            limits = {}
+            for motor_id in self.motor_ids:
+                available, error = reader.isAvailable(motor_id, SMS_STS_MIN_ANGLE_LIMIT_L, 4)
+                if not available or error:
+                    self._flush_input_buffer()
+                    raise OSError(f'STS position limits unavailable for motor {motor_id}: {error}')
+                low = reader.getData(motor_id, SMS_STS_MIN_ANGLE_LIMIT_L, 2)
+                high = reader.getData(motor_id, SMS_STS_MAX_ANGLE_LIMIT_L, 2)
+                if not 0 <= low < high <= POS_MAX:
+                    raise ValueError(f'Invalid STS servo position limits: ID {motor_id}, {low}, {high}')
+                limits[motor_id] = tuple(sorted((self._raw_to_rad(low, self.pos_scale),
+                                                self._raw_to_rad(high, self.pos_scale))))
+            return limits
+
+    def read_sts_control_status(self) -> dict[int, dict]:
+        """Read STS arm control/feedback registers without changing servo state.
+
+        STS register 48 is the torque limit; register 44 is not a torque-limit
+        register. Keep this diagnostic separate from the ORCA HLS write path.
+        """
+        self._check_connected()
+        with self._bus_lock:
+            reader = GroupSyncRead(self.packet_handler, 33, 38)
+            for motor_id in self.motor_ids:
+                reader.addParam(motor_id)
+            if reader.txRxPacket() != COMM_SUCCESS:
+                self._flush_input_buffer()
+                raise OSError('STS control status read failed')
+            status = {}
+            for motor_id in self.motor_ids:
+                available, error = reader.isAvailable(motor_id, 33, 38)
+                if not available or error:
+                    self._flush_input_buffer()
+                    raise OSError(f'STS control status unavailable for motor {motor_id}: {error}')
+
+                def value(address, size=1):
+                    return reader.getData(motor_id, address, size)
+
+                def position(address):
+                    signed = self.packet_handler.scs_tohost(value(address, 2), 15)
+                    return self._raw_to_rad(signed, self.pos_scale)
+
+                status[motor_id] = {
+                    'mode': value(33), 'torque_enabled': value(40),
+                    'torque_limit_raw': value(48, 2),
+                    'goal_rad': position(42), 'position_rad': position(56),
+                    'voltage_v': value(62) / 10.0, 'temperature_c': value(63),
+                    'error_status': value(65),
+                    'current_ma': self.packet_handler.scs_tohost(value(69, 2), 15) * self.cur_scale,
+                }
+            return status
 
     def read_position_velocity_current(self) -> MotorRead:
         """Read position, velocity, and current for all motors in one sync packet.

@@ -2,7 +2,8 @@ motor_type: feetech
 # MOTOR_BAUD_RATES[feetech] only lists 1M; the 3M rate of the Dynamixel v1 hand
 # is not reachable on the HLS servos.
 baudrate: 1000000
-port: /dev/ttyACM0
+# Stable USB-serial path: /dev/ttyACM* numbering swaps when adapters are replugged.
+port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_5B79079884-if00
 # FeetechClient maps mA straight onto the 0-1000 torque limit register, so this
 # is 40% torque. Raise it if the fingers stall before reaching their ROM.
 # Wrist needs more torque than fingers to reach the rear hardstop under load.
@@ -19,11 +20,13 @@ joint_ids: [thumb_mcp, thumb_abd, thumb_pip, thumb_dip, index_abd, index_mcp, in
 
 # Which motor ID is physically connected to which joint
 # Motor IDs from physical probe 2026-08-30 (this unit ≠ stock v1 wiring).
+# Thumb axes rechecked against model motion 2026-10-27: ID13 is the model's
+# thumb_mcp (user: CMC/root); ID16 is thumb_pip (user: MCP flexion).
 # Signs kept from prior local polarity; re-check flex/extend after recalibrate.
 joint_to_motor_map:
-  thumb_mcp: 16
+  thumb_mcp: 13   # user: 엄지 CMC/root; verified against model axis
   thumb_abd: 14
-  thumb_pip: 13   # user: 엄지 CMC
+  thumb_pip: 16   # user: 엄지 MCP flexion; verified against model axis
   thumb_dip: 15   # user: 엄지 IP
   index_abd: -3
   index_mcp: 2
@@ -84,8 +87,16 @@ calibration_current: 300
 wrist_calibration_current: 600
 calibration_step_size: 0.1
 calibration_step_period: 0.001
-calibration_num_stable: 10  # should be period * num_stable > 1
+# A hardstop is declared after this many consecutive reads within the threshold.
+# 10 was short enough that freshly tensioned (slow) tendons tripped it mid-travel.
+calibration_num_stable: 30
 calibration_threshold: 0.01
+# This unit's thumb IP previously completed a visually confirmed 2.3807 rad
+# motor sweep. Reject a shortened sweep rather than relabel it as full ROM.
+# 1.8 rad is a local acceptance floor (~75% of that travel), not a force target
+# or an official ORCA value. Revalidate after changing tendons or mechanics.
+calibration_min_motor_span_rad:
+  thumb_dip: 1.8
 
 calibration_sequence:
   - step: 1
