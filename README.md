@@ -29,6 +29,25 @@ cd orca-hand-data-collector
 공개 수집본은 [Hugging Face](https://huggingface.co/datasets/saybeok03/orca-hand-bottle)에
 있고, `collection-v2-165`는 165개 에피소드·141,740프레임의 고정 버전입니다.
 
+## Policy inference: joint coordinates and hardware travel
+
+The taught arm initial pose is the policy arm zero (`[0, 0, 0]`), not the
+three raw motor angles in `initial_pose.json`. The arm client applies
+`motor_rad = motor_home_rad + joint_signs * policy_arm_rad` exactly once.
+Pass the unnormalized 20-element canonical model-radian action through
+`Am200HardwareSink.dispatch_action(RobotJointCommand.now(tuple(sink.joint_ids), action))`.
+Hand targets also need this sink's model-reference-to-physical-degree conversion.
+Do not send the canonical vector directly to the low-level motor writer.
+
+After connecting, the hardware sink now clips arm targets to the actual servo
+travel in the taught-home coordinates, even without a teleop composer or ACT
+limiter. This assembly's saved shoulder-lift home is at one endpoint: its
+policy upper bound is 0 rad. Static simulation joint ranges are not hardware
+limits. Keep the inference loop's speed/acceleration limiter; target clipping
+does not limit speed. This does not repair a wrong joint order, missing saved
+unnormalizer, or duplicated home offset. The existing runner is ACT-only;
+Pi0.5 still requires its own model/LoRA/processor loading code.
+
 ## Layout
 
 ```
